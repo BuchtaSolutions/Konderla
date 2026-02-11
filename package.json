@@ -1,0 +1,12 @@
+{
+  "devDependencies": {
+    "@types/pg": "^8.16.0"
+  },
+  "dependencies": {
+    "@heroui/checkbox": "^2.3.29",
+    "formidable": "^3.5.4",
+    "googleapis": "^170.1.0",
+    "pg": "^8.16.3",
+    "xlsx": "^0.18.5"
+  }
+}

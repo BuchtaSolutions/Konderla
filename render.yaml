@@ -1,0 +1,43 @@
+# Render Blueprint – Konderla (DB + Backend + Frontend)
+# https://docs.render.com/blueprint-spec
+# Po pushu připoj repo v Render Dashboard: New → Blueprint → vyber repozitář.
+
+databases:
+  - name: konderla-db
+    plan: free
+    databaseName: procurement
+    region: frankfurt
+
+services:
+  # Backend (FastAPI)
+  - type: web
+    name: konderla-be
+    runtime: python
+    region: frankfurt
+    rootDir: konderla-dev-be
+    buildCommand: pip install -r requirements.txt
+    preDeployCommand: python migrate.py
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: konderla-db
+          property: connectionString
+      - key: GOOGLE_API_KEY
+        sync: false
+        # Nastav v Render Dashboard (Environment) nebo jako Secret
+
+  # Frontend (Next.js)
+  - type: web
+    name: konderla-fe
+    runtime: node
+    region: frankfurt
+    rootDir: konderla-dev-fe
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    envVars:
+      # URL backendu (např. https://konderla-be.onrender.com). Nastav v Dashboardu
+      # po prvním deployi backendu, nebo použij fromService pokud Render podporuje.
+      - key: NEXT_PUBLIC_API_URL
+        sync: false

@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+google-generativeai>=0.7.2
+python-dotenv
+pydantic
+httpx
+python-multipart
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+pandas
+openpyxl
+reportlab
+matplotlib
