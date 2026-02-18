@@ -46,6 +46,7 @@ _cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.
 cors_list = [o.strip() for o in _cors_origins.split(",") if o.strip()] or [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://konderla-dev-fe.vercel.app",
 ]
 
 app.add_middleware(
