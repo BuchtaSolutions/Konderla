@@ -41,13 +41,16 @@ def startup_log():
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS: s allow_credentials=True nelze použít allow_origins=["*"] – prohlížeč to blokuje.
-# Nastav CORS_ORIGINS (oddělené čárkou), výchozí je localhost pro FE.
-_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").strip()
-cors_list = [o.strip() for o in _cors_origins.split(",") if o.strip()] or [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://konderla-dev-fe.vercel.app",
-]
+# Nastav CORS_ORIGINS (oddělené čárkou), výchozí obsahuje localhost i Vercel.
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,https://konderla-dev-fe.vercel.app").strip()
+cors_list = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+if not cors_list:
+    cors_list = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://konderla-dev-fe.vercel.app",
+    ]
+print(f"[CORS] Allowed origins: {cors_list}")
 
 app.add_middleware(
     CORSMiddleware,
