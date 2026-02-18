@@ -185,6 +185,17 @@ def process_excel_file(file_path: str, provided_name: Optional[str] = None) -> O
             print("Detected Type 1 (Stavba)")
             return process_type_1(xls, filename, provided_name)
 
+        # Type 2 má přednost před Type 3 Var 3, pokud má "Rekapitulace" nebo "Krycí list" (jasné znaky Type 2)
+        if has_kryci or has_rekapitulace:
+            # Ale ne "Rekapitulace stavby" - to je Type 3 Unistav
+            if not any("rekapitulace stavby" in s.lower() for s in sheet_names):
+                result_type2 = process_type_2(xls, filename, provided_name)
+                has_parent = bool(result_type2 and result_type2.get("parent_budget", {}).get("items"))
+                has_children = bool(result_type2 and result_type2.get("child_budgets"))
+                if has_parent or has_children:
+                    print("Using Type 2 (Rekapitulace/Krycí) - priority check" + (" with parent items" if has_parent else " (child sheets only)"))
+                    return result_type2
+
         # Type 3 (Var 3): jakýkoli list se strukturou SOUPIS PRACÍ + PČ/Typ/Kód + D/K řádky – stejný parser pro všechny takové xlsx
         print(f"[Type3 Var3] Checking {len(sheet_names)} sheets for Var 3 pattern...")
         for sheet_name in sheet_names:
@@ -396,8 +407,9 @@ def _sheet_has_unistav_soupis_pattern(df: pd.DataFrame) -> bool:
             break
     if header_idx < 0 or typ_col_idx < 0:
         return False
-    # Ověřit, že pod hlavičkou jsou řádky D a K
+    # Ověřit, že pod hlavičkou jsou řádky D a K (povinné pro Type 3 Var 3)
     seen_d = seen_k = False
+    d_count = k_count = 0
     for idx in range(header_idx + 1, min(header_idx + 500, len(df))):
         row = df.iloc[idx]
         if typ_col_idx >= len(row):
@@ -405,11 +417,16 @@ def _sheet_has_unistav_soupis_pattern(df: pd.DataFrame) -> bool:
         typ = str(row.iloc[typ_col_idx]).strip().upper() if pd.notna(row.iloc[typ_col_idx]) else ""
         if typ == "D":
             seen_d = True
+            d_count += 1
         if typ == "K":
             seen_k = True
+            k_count += 1
         if seen_d and seen_k:
-            return True
-    return bool(has_soupis and header_idx >= 0)
+            # Musí být alespoň několik D a K řádků, aby to bylo Type 3 (ne jen náhodná shoda)
+            if d_count >= 2 and k_count >= 3:
+                return True
+    # Fallback: pokud není "soupis prací", nevrátit True (aby se Type 2 nedetekovalo jako Type 3)
+    return False
 
 
 def _parse_unistav_rekap_stavby(df: pd.DataFrame) -> List[Dict[str, Any]]:
