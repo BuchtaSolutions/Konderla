@@ -185,18 +185,92 @@ def process_excel_file(file_path: str, provided_name: Optional[str] = None) -> O
             print("Detected Type 1 (Stavba)")
             return process_type_1(xls, filename, provided_name)
 
-        # Nejdřív Type 2 (Rekapitulace Pozice/Popis/Cena) – aby se Type 2 soubory nespadly na Type 3
-        result = process_type_2(xls, filename, provided_name)
-        has_parent = bool(result and result.get("parent_budget", {}).get("items"))
-        has_children = bool(result and result.get("child_budgets"))
-        if has_parent or has_children:
-            print("Using Type 2 (Rekapitulace)" + (" with parent items" if has_parent else " (child sheets only)"))
-            return result
-        if has_kryci or has_rekapitulace:
-            print("Detected Krycí list or Rekapitulace, returning Type 2 result")
-            return result
+        # Type 3 (Var 3): jakýkoli list se strukturou SOUPIS PRACÍ + PČ/Typ/Kód + D/K řádky – stejný parser pro všechny takové xlsx
+        print(f"[Type3 Var3] Checking {len(sheet_names)} sheets for Var 3 pattern...")
+        for sheet_name in sheet_names:
+            if "pokyny" in sheet_name.lower():
+                print(f"[Type3 Var3]   Skipping sheet '{sheet_name}' (pokyny)")
+                continue
+            try:
+                df_sheet = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                if df_sheet is None or len(df_sheet) < 50:
+                    print(f"[Type3 Var3]   Sheet '{sheet_name}': skipped (rows={len(df_sheet) if df_sheet is not None else 0})")
+                    continue
+                has_pattern = _sheet_has_unistav_soupis_pattern(df_sheet)
+                print(f"[Type3 Var3]   Sheet '{sheet_name}': pattern={has_pattern}, rows={len(df_sheet)}")
+                if not has_pattern:
+                    continue
+                print(f"[Type3 Var3]   Parsing sheet '{sheet_name}' with _parse_unistav_soupis...")
+                parent_items_u, child_budgets_u = _parse_unistav_soupis(df_sheet)
+                print(f"[Type3 Var3]   Result: {len(parent_items_u)} parent items, {len(child_budgets_u)} child budgets")
+                if parent_items_u or child_budgets_u:
+                    project_name = provided_name if provided_name else filename.rsplit(".", 1)[0]
+                    print(
+                        f"Excel '{filename}' parsed as Type 3 (Var 3 Soupis pattern) using sheet '{sheet_name}' -> "
+                        f"{len(parent_items_u)} parent items, {len(child_budgets_u)} child budgets"
+                    )
+                    return {
+                        "type": "type3",
+                        "parent_budget": {"name": project_name, "items": parent_items_u},
+                        "child_budgets": child_budgets_u,
+                    }
+            except Exception as e:
+                print(f"[Type3 Var3]   Sheet '{sheet_name}' failed: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
 
-        # Type 3: jeden list s REKAPITULACE ČLENĚNÍ + SOUPIS PRACÍ (Unistav) – až když Type 2 nic nenašel
+        # Heuristika pro Unistav export: list „Rekapitulace stavby“ + Soupis v jiném listu (zachováno pro kompatibilitu)
+        unistav_rekap_sheets = [s for s in sheet_names if "rekapitulace stavby" in s.lower()]
+        if unistav_rekap_sheets:
+            try:
+                df_unistav = pd.read_excel(xls, sheet_name=unistav_rekap_sheets[0], header=None)
+                # Nejprve zkusit vytáhnout hierarchii ze Soupisu prací v jiném listu
+                soup_sheets = [s for s in sheet_names if s not in unistav_rekap_sheets and "pokyny" not in s.lower()]
+                parent_items_unistav: List[Dict[str, Any]] = []
+                child_budgets_unistav: List[Dict[str, Any]] = []
+                if soup_sheets:
+                    df_soup = pd.read_excel(xls, sheet_name=soup_sheets[0], header=None)
+                    print(f"DEBUG: Calling _parse_unistav_soupis with sheet '{soup_sheets[0]}', df shape: {df_soup.shape}")
+                    parent_items_unistav, child_budgets_unistav = _parse_unistav_soupis(df_soup)
+                    print(f"DEBUG: _parse_unistav_soupis returned: {len(parent_items_unistav)} parent items, {len(child_budgets_unistav)} child budgets")
+
+                print(f"DEBUG: After _parse_unistav_soupis: parent_items_unistav={len(parent_items_unistav)}, child_budgets_unistav={len(child_budgets_unistav)}")
+                if parent_items_unistav or child_budgets_unistav:
+                    project_name = provided_name if provided_name else filename.rsplit(".", 1)[0]
+                    print(
+                        f"Excel '{filename}' parsed as Type 3 (Unistav Soupis heuristic) "
+                        f"using sheet '{soup_sheets[0]}' -> "
+                        f"{len(parent_items_unistav)} parent items, {len(child_budgets_unistav)} child budgets"
+                    )
+                    return {
+                        "type": "type3",
+                        "parent_budget": {
+                            "name": project_name,
+                            "items": parent_items_unistav,
+                        },
+                        "child_budgets": child_budgets_unistav,
+                    }
+                else:
+                    print(f"DEBUG: Skipping Unistav Soupis result - both lists are empty")
+
+                # Fallback: použít jen rekapitulaci stavby (jedna položka „Bytový dům“)
+                parent_items_unistav = _parse_unistav_rekap_stavby(df_unistav)
+                if parent_items_unistav:
+                    project_name = provided_name if provided_name else filename.rsplit(".", 1)[0]
+                    print(f"Excel '{filename}' parsed as Type 3 (Unistav stavba heuristic) using sheet '{unistav_rekap_sheets[0]}' -> {len(parent_items_unistav)} parent items")
+                    return {
+                        "type": "type3",
+                        "parent_budget": {
+                            "name": project_name,
+                            "items": parent_items_unistav,
+                        },
+                        "child_budgets": [],
+                    }
+            except Exception as e:
+                print(f"Type 3 heuristic for '{filename}' failed: {e}")
+
+        # Type 3 (Unistav): zkusit před Type 2, protože má velmi specifické hlavičky
         for sheet in sheet_names[:5]:
             try:
                 df_sheet = pd.read_excel(xls, sheet_name=sheet, header=None)
@@ -207,6 +281,17 @@ def process_excel_file(file_path: str, provided_name: Optional[str] = None) -> O
                         return result3
             except Exception:
                 pass
+
+        # Type 2: Rekapitulace Pozice/Popis/Cena (včetně fallbacku „child sheets only“)
+        result = process_type_2(xls, filename, provided_name)
+        has_parent = bool(result and result.get("parent_budget", {}).get("items"))
+        has_children = bool(result and result.get("child_budgets"))
+        if has_parent or has_children:
+            print("Using Type 2 (Rekapitulace)" + (" with parent items" if has_parent else " (child sheets only)"))
+            return result
+        if has_kryci or has_rekapitulace:
+            print("Detected Krycí list or Rekapitulace, returning Type 2 result")
+            return result
 
         print("Using fallback (Default to Type 1)")
         return process_type_1(xls, filename, provided_name)
@@ -288,6 +373,329 @@ def _is_type3_content(df: pd.DataFrame) -> bool:
     has_rekap = "rekapitulace členění soupisu prací" in full_text_lower
     has_soupis = "soupis prací" in full_text_lower or "soupis praci" in full_text_lower
     return bool(has_rekap and has_soupis)
+
+
+def _sheet_has_unistav_soupis_pattern(df: pd.DataFrame) -> bool:
+    """Detekce listu se strukturou Type 3 Soupis: řádek s PČ, Typ, Kód (+ volitelně ‚soupis prací‘). Stačí hlavička a řádky D/K."""
+    if df is None or len(df) < 20:
+        return False
+    header_idx = -1
+    has_soupis = False
+    typ_col_idx = -1
+    for idx in range(min(250, len(df))):
+        row = df.iloc[idx]
+        row_text = " ".join(str(v).lower() for v in row.values if pd.notna(v))
+        if "soupis prací" in row_text or "soupis praci" in row_text:
+            has_soupis = True
+        if "pč" in row_text and "typ" in row_text and ("kód" in row_text or "kod" in row_text):
+            header_idx = idx
+            for c, val in enumerate(row.values):
+                if pd.notna(val) and str(val).strip().upper() == "TYP":
+                    typ_col_idx = c
+                    break
+            break
+    if header_idx < 0 or typ_col_idx < 0:
+        return False
+    # Ověřit, že pod hlavičkou jsou řádky D a K
+    seen_d = seen_k = False
+    for idx in range(header_idx + 1, min(header_idx + 500, len(df))):
+        row = df.iloc[idx]
+        if typ_col_idx >= len(row):
+            continue
+        typ = str(row.iloc[typ_col_idx]).strip().upper() if pd.notna(row.iloc[typ_col_idx]) else ""
+        if typ == "D":
+            seen_d = True
+        if typ == "K":
+            seen_k = True
+        if seen_d and seen_k:
+            return True
+    return bool(has_soupis and header_idx >= 0)
+
+
+def _parse_unistav_rekap_stavby(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Speciální parser pro Unistav list 'Rekapitulace stavby' s blokem
+    'REKAPITULACE OBJEKTŮ STAVBY A SOUPISŮ PRACÍ'.
+    Vytáhne objekty (Bytový dům, atd.) jako parent items.
+    """
+    if df is None or len(df) < 10:
+        return []
+
+    header_idx = -1
+    col_code = -1
+    col_name = -1
+    col_price = -1
+
+    # Najít hlavičku: řádek obsahující "Objekt, Soupis prací" a "Cena bez DPH"
+    for idx in range(min(100, len(df))):
+        row = df.iloc[idx]
+        row_lower = [str(v).lower() for v in row.values if pd.notna(v)]
+        has_obj = any("objekt" in v and "soupis" in v for v in row_lower)
+        has_price = any("cena bez dph" in v for v in row_lower)
+        has_kod = any("kód" in v or "kod" in v for v in row_lower)
+        if has_obj and has_price and has_kod:
+            header_idx = idx
+            for c, val in enumerate(row.values):
+                v = str(val).strip().lower() if pd.notna(val) else ""
+                if ("kód" in v or "kod" in v) and col_code == -1:
+                    col_code = c
+                elif "objekt" in v and "soupis" in v and col_name == -1:
+                    col_name = c
+                elif "cena bez dph" in v and col_price == -1:
+                    col_price = c
+            break
+
+    if header_idx == -1 or col_name == -1 or col_price == -1:
+        return []
+
+    parent_items: List[Dict[str, Any]] = []
+
+    for idx in range(header_idx + 1, len(df)):
+        row = df.iloc[idx]
+        # Přeskočit prázdné řádky
+        if all((not pd.notna(v)) or (str(v).strip() == "") for v in row.values):
+            continue
+
+        # Zjistit název objektu/soupisu – Unistav má hlavičku v jednom sloupci,
+        # ale samotná data často v jiných (např. sloupec 3 + 9).
+        name = ""
+        if 0 <= col_name < len(row) and pd.notna(row.iloc[col_name]):
+            name = str(row.iloc[col_name]).strip()
+        if not name:
+            # fallback: zkusit sloupce 3 a 9 (podle zjištěné struktury)
+            for c in (3, 9, 2):
+                if c < len(row) and pd.notna(row.iloc[c]) and str(row.iloc[c]).strip():
+                    name = str(row.iloc[c]).strip()
+                    break
+        if not name:
+            continue
+
+        lower_row_text = " ".join(str(v).lower() for v in row.values if pd.notna(v))
+        # Přeskočit řádek "Náklady stavby celkem"
+        if "náklady stavby celkem" in lower_row_text or "naklady stavby celkem" in lower_row_text:
+            continue
+
+        price = 0.0
+        try:
+            if col_price < len(row):
+                price = clean_price(row.iloc[col_price])
+        except Exception:
+            price = 0.0
+
+        if price <= 0:
+            continue
+
+        code = ""
+        if col_code != -1 and col_code < len(row) and pd.notna(row.iloc[col_code]):
+            code = str(row.iloc[col_code]).strip()
+
+        parent_items.append({
+            "number": code,
+            "name": name,
+            "price": price,
+            "is_section_header": True,
+        })
+
+    return parent_items
+
+
+def _parse_unistav_soupis(df: pd.DataFrame) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Speciální parser pro Unistav Soupis prací v listu typu
+    „Bytový dům - Nájemní bydlení …“.
+    Vytáhne hierarchii podle řádků typu D (sekce) a K (položky),
+    aby struktura odpovídala Type 1/2: parent_items + child_budgets.
+    """
+    if df is None or len(df) < 50:
+        return [], []
+
+    parent_items: List[Dict[str, Any]] = []
+    child_budgets: List[Dict[str, Any]] = []
+
+    # Najít začátek bloku SOUPIS PRACÍ a hlavičku PČ / Typ / Kód / Popis / Cena celkem
+    soupis_start = 0
+    header_idx = -1
+    typ_col = -1
+    kod_col = -1
+    popis_col = -1
+    cena_col = -1
+    mnozstvi_col = -1
+    j_cena_col = -1
+
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        row_text = " ".join(str(v).lower() for v in row.values if pd.notna(v))
+        if "soupis prací" in row_text or "soupis praci" in row_text:
+            soupis_start = idx
+        if "pč" in row_text and "typ" in row_text and "kód" in row_text and header_idx < 0:
+            header_idx = idx
+            for c, val in enumerate(row.values):
+                v = str(val).strip().lower() if pd.notna(val) else ""
+                if v == "typ":
+                    typ_col = c
+                elif v in ("kód", "kod"):
+                    kod_col = c
+                elif v == "popis":
+                    popis_col = c
+                elif "cena celkem" in v and "czk" in v:
+                    cena_col = c
+                elif v == "množství" or v == "mnozstvi":
+                    mnozstvi_col = c
+                elif "j.cena" in v and "czk" in v:
+                    j_cena_col = c
+
+    if header_idx < 0:
+        # fallback – použít pevné indexy podle známé struktury
+        header_idx = soupis_start + 12  # cca řádek s hlavičkou tabulky
+    if typ_col < 0:
+        typ_col = 3
+    if kod_col < 0:
+        kod_col = 4
+    if popis_col < 0:
+        popis_col = 5
+    if cena_col < 0:
+        cena_col = 9
+    if mnozstvi_col < 0:
+        mnozstvi_col = 7
+    if j_cena_col < 0:
+        j_cena_col = 8
+
+    # Mapování: kód sekce (1, 2, 3, 711, N00, VRN, R, ...) -> seznam položek (K řádky)
+    items_by_section: Dict[str, List[Dict[str, Any]]] = {}
+    current_section_code: Optional[str] = None
+    current_main_in_soupis: Optional[str] = None  # HSV / PSV skupiny – pouze pro mapování, ne jako vlastní budget
+
+    print(f"_parse_unistav_soupis: header_idx={header_idx}, typ_col={typ_col}, kod_col={kod_col}, popis_col={popis_col}, cena_col={cena_col}")
+    
+    for idx in range(header_idx + 1, len(df)):
+        row = df.iloc[idx]
+        ncol = len(row)
+        if typ_col >= ncol:
+            continue
+
+        typ = str(row.iloc[typ_col]).strip().upper() if pd.notna(row.iloc[typ_col]) else ""
+
+        if typ == "D":
+            kod = str(row.iloc[kod_col]).strip() if kod_col < ncol and pd.notna(row.iloc[kod_col]) else ""
+            popis = str(row.iloc[popis_col]).strip() if popis_col < ncol and pd.notna(row.iloc[popis_col]) else ""
+            try:
+                cena = clean_price(row.iloc[cena_col]) if cena_col < ncol else 0.0
+            except Exception:
+                cena = 0.0
+
+            if not kod:
+                current_section_code = None
+                continue
+
+            # Stejná heuristika jako v _parse_type3_single_sheet – HSV/PSV jsou jen skupiny,
+            # podsekce (1, 2, 3, 711...) tvoří skutečné podrozpočty, N00/VRN/R jsou samostatné sekce.
+            kod_stripped = kod.strip()
+            is_code_candidate = bool(
+                kod_stripped
+                and (kod_stripped.isdigit() or (len(kod_stripped) <= 6 and re.match(r"^[A-Z0-9\.]+$", kod_stripped)))
+            )
+            if not is_code_candidate:
+                current_section_code = None
+                continue
+
+            is_numeric = bool(re.match(r"^\d+(\.\d+)?$", kod_stripped))
+            is_standalone_section = kod_stripped.upper() in ("N00", "VRN", "R")
+
+            if not is_numeric and not is_standalone_section:
+                # HSV, PSV – skupinové hlavičky, jen si je pamatujeme jako "current_main_in_soupis"
+                current_main_in_soupis = kod_stripped
+                current_section_code = None
+                if idx < header_idx + 100:  # Debug first 100 D rows
+                    print(f"  Row {idx}: D row '{kod_stripped}' ({popis[:40]}) -> group header, current_section_code=None")
+            else:
+                # Skutečná sekce/podrozpočet
+                current_section_code = kod_stripped
+                if current_section_code not in items_by_section:
+                    items_by_section[current_section_code] = []
+
+                # Přidej do parent_items jako řádek v main budgetu
+                parent_items.append(
+                    {
+                        "number": kod_stripped,
+                        "name": popis or kod_stripped,
+                        "price": cena,
+                        "is_section_header": True,
+                    }
+                )
+                if idx < header_idx + 100:  # Debug first 100 D rows
+                    print(f"  Row {idx}: D row '{kod_stripped}' ({popis[:40]}) -> section, current_section_code='{current_section_code}'")
+            continue
+
+        if typ == "K":
+            if not current_section_code:
+                if idx < header_idx + 50:  # Debug first 50 K rows
+                    print(f"  Row {idx}: K row but no current_section_code (typ='{typ}')")
+                continue
+            popis = str(row.iloc[popis_col]).strip() if popis_col < ncol and pd.notna(row.iloc[popis_col]) else ""
+            if not popis:
+                continue
+            try:
+                cena = clean_price(row.iloc[cena_col]) if cena_col < ncol else 0.0
+            except Exception:
+                cena = 0.0
+            # Moravostav a podobné: sloupec "Cena celkem" může být 0, cena je v Množství * J.cena
+            if cena <= 0 and mnozstvi_col < ncol and j_cena_col < ncol:
+                try:
+                    m = clean_price(row.iloc[mnozstvi_col])
+                    j = clean_price(row.iloc[j_cena_col])
+                    if m > 0 and j > 0:
+                        cena = round(m * j, 2)
+                except Exception:
+                    pass
+            if cena <= 0:
+                continue
+            kod_polozky = str(row.iloc[kod_col]).strip() if kod_col < ncol and pd.notna(row.iloc[kod_col]) else ""
+            items_by_section.setdefault(current_section_code, []).append(
+                {"number": kod_polozky, "name": popis, "price": cena}
+            )
+            if idx < header_idx + 50:  # Debug first 50 K rows
+                print(f"  Row {idx}: Added K item to section '{current_section_code}': '{popis[:40]}' price={cena}")
+
+    # Vytvořit child_budgets z items_by_section
+    for sec_code, items in items_by_section.items():
+        if not items:
+            continue
+        # Najít odpovídající parent položku kvůli názvu
+        sec_name = sec_code
+        for p in parent_items:
+            if str(p.get("number", "")).strip() == sec_code:
+                sec_name = p.get("name") or sec_code
+                break
+        child_budgets.append(
+            {
+                "name": sec_name,
+                "number_code": sec_code,
+                "items": items,
+            }
+        )
+
+    # Doplň ceny u parent položek součtem položek v podbudgetu (když v Excelu jsou D řádky s cenou 0)
+    section_totals = {sec_code: sum(it["price"] for it in items) for sec_code, items in items_by_section.items()}
+    enriched_count = 0
+    for p in parent_items:
+        num = str(p.get("number", "")).strip()
+        old_price = p.get("price", 0)
+        if num in section_totals and (not old_price or float(old_price) <= 0):
+            new_price = round(section_totals[num], 2)
+            if new_price > 0:
+                p["price"] = new_price
+                enriched_count += 1
+                if enriched_count <= 5:  # Log first 5
+                    print(f"  Enriched parent item '{num}' ({p.get('name', '')[:30]}): {old_price} -> {new_price}")
+    if enriched_count > 0:
+        print(f"_parse_unistav_soupis: enriched {enriched_count} parent items with prices from child budgets")
+
+    print(f"_parse_unistav_soupis: found {len(parent_items)} parent items, {len(child_budgets)} child budgets")
+    print(f"_parse_unistav_soupis: sections found: {list(items_by_section.keys())}")
+    for sec_code, items in items_by_section.items():
+        print(f"  Section '{sec_code}': {len(items)} items")
+
+    return parent_items, child_budgets
 
 
 def _parse_type3_single_sheet(df: pd.DataFrame) -> Optional[Dict[str, Any]]:

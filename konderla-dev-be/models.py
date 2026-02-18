@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, JSON, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from sqlalchemy.sql import func
 from database import Base
 import uuid
@@ -57,7 +57,7 @@ class Budget(Base):
     dynamic_fields = Column(JSON, default={})
 
     round = relationship("Round", back_populates="budgets")
-    parent = relationship("Budget", remote_side=[id], backref="children")
+    parent = relationship("Budget", remote_side=[id], backref=backref("children", cascade="all, delete-orphan"))
     notes_history = relationship("BudgetNote", back_populates="budget", cascade="all, delete-orphan")
 
 class BudgetNote(Base):

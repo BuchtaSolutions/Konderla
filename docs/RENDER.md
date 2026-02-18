@@ -1,4 +1,4 @@
-# Nasazení na Render (Blueprint)
+x# Nasazení na Render (Blueprint)
 
 Projekt je připraven na deploy přes [Render](https://render.com) pomocí Blueprintu (`render.yaml`).
 
@@ -22,6 +22,7 @@ Projekt je připraven na deploy přes [Render](https://render.com) pomocí Bluep
 4. **Environment variables (po prvním deployi)**  
    - **konderla-be**:  
      - `GOOGLE_API_KEY` – (volitelné) pro Gemini AI. Nastav v **Environment** nebo jako **Secret**.
+     - `CORS_ORIGINS` – povolené originy (CORS), oddělené čárkou. Na Renderu nastav na URL frontendu, např. `https://konderla-fe.onrender.com`. (Lokálně stačí výchozí `http://localhost:3000,http://127.0.0.1:3000`.)
    - **konderla-fe**:  
      - `NEXT_PUBLIC_API_URL` – URL backendu, např. `https://konderla-be.onrender.com`  
      (bez koncové lomítko). Bez toho bude frontend volat localhost.

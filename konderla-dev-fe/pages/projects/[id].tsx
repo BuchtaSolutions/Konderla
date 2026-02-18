@@ -18,7 +18,7 @@ import {
 import { Checkbox } from "@heroui/checkbox";
 import { Popover, PopoverTrigger, PopoverContent } from "@heroui/popover";
 import DefaultLayout from "@/layouts/default";
-import { getProject, getRounds, getBudgets, promoteRound, createRound, createBudget, deleteBudget, deleteRound, mergeRoundItems, updateBudget, getBudgetNotes, createBudgetNote, updateProject, deleteProject, detectDuplicates, deleteDuplicate, uploadToDrive, uploadBudgetExcel, exportRoundPdf } from "@/lib/api";
+import { getProject, getRounds, getBudgets, promoteRound, createRound, createBudget, deleteBudget, deleteRound, mergeRoundItems, updateBudget, getBudgetNotes, createBudgetNote, updateProject, deleteProject, detectDuplicates, deleteDuplicate, uploadBudgetExcel, exportRoundPdf } from "@/lib/api";
 import { Link } from "@heroui/link";
 import ChatWidget from "@/components/ChatWidget";
 import { DeleteIcon, EditIcon } from "@/components/icons";
@@ -1267,7 +1267,7 @@ function RoundView({
                 )}
             </Button>
           </TableColumn>
-          {(sortedBudgets || []).map((budget: any) => {
+          {((sortedBudgets || []).map((budget: any) => {
             // Pokud je to child budget (má parent_budget_id), zobrazit název parent budgetu
             const displayName = budget.parent_budget_id && drillStack.length > 0 
               ? rootBudgets.find((p: any) => {
@@ -1275,50 +1275,50 @@ function RoundView({
                   return currentLevel.budgetMap[p.id] === budget.id;
                 })?.name || budget.name
               : budget.name;
-            
+
             return (
-            <TableColumn key={budget.id} className="min-w-[150px]">
-              <div className="flex flex-col gap-1">
-                <div className="flex items-center gap-2">
+              <TableColumn key={budget.id} className="min-w-[150px]">
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center gap-2">
                     <span className="font-bold text-large truncate max-w-[120px]" title={displayName}>{displayName}</span>
                     {budget.isPlaceholder && (
-                        <span className="text-tiny px-1 rounded bg-default-200 text-default-600">N/A</span>
+                      <span className="text-tiny px-1 rounded bg-default-200 text-default-600">N/A</span>
                     )}
                     {budget.parent_budget_id && drillStack.length > 0 && (
-                        <span className="text-tiny px-1 rounded bg-primary-100 text-primary-700" title={budget.name}>
-                          {budget.name}
-                        </span>
+                      <span className="text-tiny px-1 rounded bg-primary-100 text-primary-700" title={budget.name}>
+                        {budget.name}
+                      </span>
                     )}
-                </div>
-                {!budget.isPlaceholder && !isPresentationMode && (
-                  <div className="flex gap-1 opacity-100 transition-opacity">
-                    <Button
-                      isIconOnly
-                      color="primary"
-                      variant="light"
-                      size="sm"
-                      onPress={() => openDrawer(budget)}
-                    >
-                      <EditIcon />
-                    </Button>
-                    <Button
-                      isIconOnly
-                      color="danger"
-                      variant="light"
-                      size="sm"
-                      onPress={() => {
-                        setBudgetToDelete(budget.id);
-                        onDeleteOpen();
-                      }}
-                    >
-                      <DeleteIcon />
-                    </Button>
                   </div>
-                )}
-              </div>
-            </TableColumn>
-          );
-          })}
+                  {!budget.isPlaceholder && !isPresentationMode && (
+                    <div className="flex gap-1 opacity-100 transition-opacity">
+                      <Button
+                        isIconOnly
+                        color="primary"
+                        variant="light"
+                        size="sm"
+                        onPress={() => openDrawer(budget)}
+                      >
+                        <EditIcon />
+                      </Button>
+                      <Button
+                        isIconOnly
+                        color="danger"
+                        variant="light"
+                        size="sm"
+                        onPress={() => {
+                          setBudgetToDelete(budget.id);
+                          onDeleteOpen();
+                        }}
+                      >
+                        <DeleteIcon />
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              </TableColumn>
+            );
+          }) as any)}
         </TableHeader>
         <TableBody>
           {/* 1. Total Price Row */}
@@ -1338,12 +1338,12 @@ function RoundView({
                 )}
               </Button>
             </TableCell>
-            {(sortedBudgets || []).map((budget: any) => {
-               if (budget.isPlaceholder) return <TableCell key={budget.id}>-</TableCell>;
-               const totalFromLabel = budget.labels?.total_price;
-               const total = typeof totalFromLabel === 'number' ? totalFromLabel : getBudgetItems(budget).reduce((sum: number, item: any) => sum + (item.price || 0), 0);
-               return <TableCell key={budget.id} className="font-bold text-primary">{total.toLocaleString()} Kč</TableCell>;
-            })}
+            {((sortedBudgets || []).map((budget: any) => {
+              if (budget.isPlaceholder) return <TableCell key={budget.id}>-</TableCell>;
+              const totalFromLabel = budget.labels?.total_price;
+              const total = typeof totalFromLabel === 'number' ? totalFromLabel : getBudgetItems(budget).reduce((sum: number, item: any) => sum + (item.price || 0), 0);
+              return <TableCell key={budget.id} className="font-bold text-primary">{total.toLocaleString()} Kč</TableCell>;
+            }) as any)}
           </TableRow>
 
           {/* 2. Score Row */}
@@ -1361,29 +1361,29 @@ function RoundView({
                 )}
               </Button>
             </TableCell>
-            {(sortedBudgets || []).map((budget: any) => (
-               <TableCell key={budget.id} className="font-bold">{budget.isPlaceholder ? '-' : (budget.score ?? '-')}</TableCell>
-            ))}
+            {((sortedBudgets || []).map((budget: any) => (
+              <TableCell key={budget.id} className="font-bold">{budget.isPlaceholder ? '-' : (budget.score ?? '-')}</TableCell>
+            )) as any)}
           </TableRow>
 
            {/* 3.1 Tags Row */}
            <TableRow key="tags">
             <TableCell className="text-gray-500 font-medium">Štítky</TableCell>
-            {(sortedBudgets || []).map((budget: any) => (
-               <TableCell key={budget.id}>
-                   <div className="flex flex-wrap gap-1">
-                       {(!budget.isPlaceholder && budget.labels?.tags || []).map((tag: string, i: number) => (
-                           <Chip key={i} size="sm" variant="flat" className="bg-blue-100 text-blue-700">
-                               {tag}
-                           </Chip>
-                       ))}
-                   </div>
-               </TableCell>
-            ))}
+            {((sortedBudgets || []).map((budget: any) => (
+              <TableCell key={budget.id}>
+                <div className="flex flex-wrap gap-1">
+                  {(!budget.isPlaceholder && budget.labels?.tags || []).map((tag: string, i: number) => (
+                    <Chip key={i} size="sm" variant="flat" className="bg-blue-100 text-blue-700">
+                      {tag}
+                    </Chip>
+                  ))}
+                </div>
+              </TableCell>
+            )) as any)}
           </TableRow>
 
           {/* 4. Dynamic Item Rows */}
-          {filteredItemNames.map((itemName: string) => {
+          {(filteredItemNames.map((itemName: string) => {
             // Check drift availability
             const isDrillable = canDrillDown(itemName);
             
@@ -1450,26 +1450,28 @@ function RoundView({
                  </Button>
                  </div>
               </TableCell>
-              {(sortedBudgets || []).map((budget: any) => {
-                 if (budget.isPlaceholder) {
-                     return <TableCell key={budget.id} className="text-default-300 text-xs italic">N/A</TableCell>;
-                 }
-                 
-                 const items = getBudgetItems(budget);
-                 const item = items.find((i: any) => i.name === itemName);
-                 const price = item ? item.price : null;
-                 
-                 return <TableCell key={budget.id}>
-                   <PriceCell 
-                     price={price} 
-                     onUpdate={(newPrice) => handleItemPriceUpdate(budget, itemName, newPrice)} 
-                     stats={stats}
-                   />
-                 </TableCell>;
-              })}
+              {((sortedBudgets || []).map((budget: any) => {
+                if (budget.isPlaceholder) {
+                  return <TableCell key={budget.id} className="text-default-300 text-xs italic">N/A</TableCell>;
+                }
+
+                const items = getBudgetItems(budget);
+                const item = items.find((i: any) => i.name === itemName);
+                const price = item ? item.price : null;
+
+                return (
+                  <TableCell key={budget.id}>
+                    <PriceCell
+                      price={price}
+                      onUpdate={(newPrice) => handleItemPriceUpdate(budget, itemName, newPrice)}
+                      stats={stats}
+                    />
+                  </TableCell>
+                );
+              }) as any)}
             </TableRow>
             );
-          })}
+          }) as any)}
         </TableBody>
       </Table>
 

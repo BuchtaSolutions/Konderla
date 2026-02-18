@@ -75,6 +75,15 @@ def get_budgets_by_round(db: Session, round_id: UUID):
 def delete_budget(db: Session, budget_id: UUID):
     db_budget = db.query(models.Budget).filter(models.Budget.id == budget_id).first()
     if db_budget:
+        # Smazat všechny child budgets (podbudgety)
+        child_budgets = db.query(models.Budget).filter(models.Budget.parent_budget_id == budget_id).all()
+        if child_budgets:
+            print(f"[Delete] Deleting {len(child_budgets)} child budgets for parent budget id={budget_id}")
+            for child in child_budgets:
+                print(f"[Delete]   Deleting child budget id={child.id}, name='{child.name}'")
+                db.delete(child)
+        # Smazat parent budget
+        print(f"[Delete] Deleting parent budget id={budget_id}, name='{db_budget.name}'")
         db.delete(db_budget)
         db.commit()
     return db_budget

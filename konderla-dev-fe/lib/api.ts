@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
 const baseURL = apiUrl.startsWith('http') ? apiUrl : `https://${apiUrl}`;
 
 const api = axios.create({
@@ -143,20 +143,6 @@ export const detectDuplicates = async (roundId: string) => {
 export const deleteDuplicate = async (duplicateId: string) => {
   const response = await api.delete(`/rounds/duplicates/${duplicateId}`);
   return response.data;
-};
-
-export const uploadToDrive = async (file: File) => {
-  const formData = new FormData();
-  formData.append('file', file);
-  
-  // Use fetch or axios to call our own Next.js API route
-  // Using direct fetch to avoid base URL issues if needed, but relative path works in Next.js
-  const response = await fetch('/api/upload-drive', {
-    method: 'POST',
-    body: formData,
-  });
-  
-  return response.json();
 };
 
 export const uploadBudgetExcel = async (data: FormData) => {

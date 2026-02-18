@@ -32,14 +32,29 @@ os.makedirs("uploads", exist_ok=True)
 
 app = FastAPI()
 
+
+@app.on_event("startup")
+def startup_log():
+    print("[Backend] Started. Excel: Var 3 (Soupis PČ/Typ/Kód + D/K) pattern enabled for all matching sheets.")
+
+
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# CORS: s allow_credentials=True nelze použít allow_origins=["*"] – prohlížeč to blokuje.
+# Nastav CORS_ORIGINS (oddělené čárkou), výchozí je localhost pro FE.
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").strip()
+cors_list = [o.strip() for o in _cors_origins.split(",") if o.strip()] or [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # For development
+    allow_origins=cors_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # Gemini Setup
@@ -122,10 +137,15 @@ async def upload_budget_excel(
             shutil.copyfileobj(file.file, file_object)
             
         # 2. Process File
+        print(f"[Upload] Processing file: {file.filename}")
         data = excel_processor.process_excel_file(file_location, provided_name=name)
         
         if not data:
              raise HTTPException(status_code=400, detail="Could not parse Excel file. Format not recognized.")
+        
+        print(f"[Upload] Parsed as type: {data.get('type')}")
+        print(f"[Upload] Parent budget items: {len(data.get('parent_budget', {}).get('items', []))}")
+        print(f"[Upload] Child budgets: {len(data.get('child_budgets', []))}")
              
         # 3. Create Parent Budget
         parent_info = data["parent_budget"]
@@ -258,6 +278,39 @@ def read_budgets(round_id: UUID, db: Session = Depends(get_db)):
     for b in budgets:
         if b.parent_budget_id:
             print(f"[API]   - Child budget: id={b.id}, name='{b.name}', parent_budget_id={b.parent_budget_id}, items={len(b.items) if b.items else 0}")
+
+    # Doplň ceny u root rozpočtů ze součtů child budgetů, pokud má položky s cenou 0 (Type3 / Moravostav)
+    for b in budgets:
+        if b.parent_budget_id or not b.items:
+            continue
+        children = [c for c in budgets if c.parent_budget_id == b.id]
+        if not children:
+            continue
+        # Obohatit jen když má smysl: aspoň jedna parent položka má cenu 0
+        has_zero = any(not (item.get("price") and float(item.get("price", 0)) > 0) for item in b.items)
+        if not has_zero:
+            continue
+        enriched_count = 0
+        for item in b.items:
+            old_price = item.get("price", 0)
+            if old_price and float(old_price) > 0:
+                continue
+            code = str(item.get("number") or "").strip()
+            name = (item.get("name") or "").strip()
+            child = None
+            if code:
+                child = next((c for c in children if str((c.labels or {}).get("code") or "").strip() == code), None)
+            if not child and name:
+                child = next((c for c in children if (c.name or "").strip() == name), None)
+            if child and child.items:
+                total = round(sum(float(i.get("price") or 0) for i in child.items), 2)
+                if total > 0:
+                    item["price"] = total
+                    enriched_count += 1
+                    if enriched_count <= 3:  # Log first 3
+                        print(f"[API]   Enriched item '{code}' ({name[:30]}): {old_price} -> {total}")
+        if enriched_count > 0:
+            print(f"[API] Root budget id={b.id} name='{b.name}': enriched {enriched_count}/{len(b.items)} parent items from {len(children)} children")
     return budgets
 
 @app.delete("/budgets/{budget_id}")
