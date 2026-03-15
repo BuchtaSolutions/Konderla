@@ -37,6 +37,8 @@ class BudgetBase(BaseModel):
     notes: Optional[str] = None
     score: Optional[float] = None
     file_path: Optional[str] = None
+    client_name: Optional[str] = None
+    client_project_name: Optional[str] = None
     labels: Optional[Dict[str, Any]] = {}
     items: Optional[Any] = []
     dynamic_fields: Optional[Dict[str, Any]] = {}
@@ -53,6 +55,8 @@ class BudgetUpdate(BaseModel):
     labels: Optional[Dict[str, Any]] = None
     items: Optional[List[Dict[str, Any]]] = None
     dynamic_fields: Optional[Dict[str, Any]] = None
+    client_name: Optional[str] = None
+    client_project_name: Optional[str] = None
 
 class Budget(BudgetBase):
     id: UUID
@@ -84,6 +88,8 @@ class Round(RoundBase):
 class ProjectBase(BaseModel):
     name: str
     description: Optional[str] = None
+    client_name: Optional[str] = None
+    client_project_name: Optional[str] = None
 
 class ProjectCreate(ProjectBase):
     pass
@@ -91,6 +97,8 @@ class ProjectCreate(ProjectBase):
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    client_name: Optional[str] = None
+    client_project_name: Optional[str] = None
 
 class Project(ProjectBase):
     id: UUID

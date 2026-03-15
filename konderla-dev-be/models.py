@@ -11,6 +11,8 @@ class Project(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()"), index=True)
     name = Column(String, index=True)
     description = Column(String, nullable=True)
+    client_name = Column(String, nullable=True)
+    client_project_name = Column(String, nullable=True)
 
     rounds = relationship("Round", back_populates="project", cascade="all, delete-orphan")
     chat_history = relationship("ChatHistory", back_populates="project", cascade="all, delete-orphan")
@@ -51,6 +53,8 @@ class Budget(Base):
     notes = Column(String, nullable=True)
     score = Column(Float, nullable=True)
     file_path = Column(String, nullable=True)
+    client_name = Column(String, nullable=True)
+    client_project_name = Column(String, nullable=True)
     
     labels = Column(JSON, default={})
     items = Column(JSON, default=[]) # list[dict(name: str, price: float)]

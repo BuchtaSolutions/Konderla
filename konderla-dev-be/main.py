@@ -16,6 +16,7 @@ import difflib
 import excel_processor
 import pdf_export
 from fastapi.responses import FileResponse
+from datetime import datetime, timezone
 
 # Load environment variables
 # Try loading from standard locations
@@ -131,6 +132,12 @@ async def upload_budget_excel(
     project_id: UUID = Form(...),
     round_id: UUID = Form(...),
     name: Optional[str] = Form(None),
+    client_name: Optional[str] = Form(None),
+    client_project_name: Optional[str] = Form(None),
+    offer_contact_name: Optional[str] = Form(None),
+    offer_contact_email: Optional[str] = Form(None),
+    offer_contact_phone: Optional[str] = Form(None),
+    offer_last_changed_at: Optional[str] = Form(None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
@@ -163,6 +170,17 @@ async def upload_budget_excel(
                 budget_name = os.path.splitext(file.filename)[0]
 
         parent_labels = {"type": data["type"], "is_parent": True}
+        if offer_contact_name and offer_contact_name.strip():
+            parent_labels["offer_contact_name"] = offer_contact_name.strip()
+        if offer_contact_email and offer_contact_email.strip():
+            parent_labels["offer_contact_email"] = offer_contact_email.strip()
+        if offer_contact_phone and offer_contact_phone.strip():
+            parent_labels["offer_contact_phone"] = offer_contact_phone.strip()
+        parent_labels["offer_last_changed_at"] = (
+            offer_last_changed_at.strip()
+            if offer_last_changed_at and offer_last_changed_at.strip()
+            else datetime.now(timezone.utc).isoformat()
+        )
         if data.get("type") == "type3" and parent_info.get("total_price") is not None:
             parent_labels["total_price"] = parent_info["total_price"]
         parent_budget = models.Budget(
@@ -172,6 +190,8 @@ async def upload_budget_excel(
             items=parent_info["items"],
             file_path=file_location,
             labels=parent_labels,
+            client_name=client_name,
+            client_project_name=client_project_name,
         )
         print(f"Creating parent budget: name='{budget_name}', items={len(parent_info['items'])}")
         for i, item in enumerate(parent_info["items"][:20]):  # Log first 20 items
@@ -188,6 +208,13 @@ async def upload_budget_excel(
             child_items = child.get("items", [])
             print(f"  Creating child budget {i+1}: name='{child_name}', items={len(child_items)}, parent_id={parent_budget.id}")
             child_labels = {"type": data["type"], "is_child": True, "code": child.get("number_code")}
+            if offer_contact_name and offer_contact_name.strip():
+                child_labels["offer_contact_name"] = offer_contact_name.strip()
+            if offer_contact_email and offer_contact_email.strip():
+                child_labels["offer_contact_email"] = offer_contact_email.strip()
+            if offer_contact_phone and offer_contact_phone.strip():
+                child_labels["offer_contact_phone"] = offer_contact_phone.strip()
+            child_labels["offer_last_changed_at"] = parent_labels["offer_last_changed_at"]
             if child.get("parent_item_code") is not None:
                 child_labels["parent_item_code"] = child["parent_item_code"]
             child_budget = models.Budget(
@@ -198,6 +225,8 @@ async def upload_budget_excel(
                 items=child_items,
                 file_path=file_location,
                 labels=child_labels,
+                client_name=client_name,
+                client_project_name=client_project_name,
             )
             db.add(child_budget)
             db.flush()  # Flush to get the ID
@@ -247,12 +276,18 @@ async def create_budget(
     project_id: UUID = Form(...),
     name: str = Form(...),
     notes: Optional[str] = Form(None),
+    client_name: Optional[str] = Form(None),
+    client_project_name: Optional[str] = Form(None),
+    labels: Optional[str] = Form(None), # JSON string
     items: Optional[str] = Form(None), # JSON string
     file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db)
 ):
     file_path = None
     parsed_items = json.loads(items) if items else []
+    parsed_labels = json.loads(labels) if labels else {}
+    if isinstance(parsed_labels, dict) and not parsed_labels.get("offer_last_changed_at"):
+        parsed_labels["offer_last_changed_at"] = datetime.now(timezone.utc).isoformat()
     
     if file:
         file_path = f"uploads/{file.filename}"
@@ -266,6 +301,9 @@ async def create_budget(
         project_id=project_id,
         name=name,
         notes=notes,
+        client_name=client_name,
+        client_project_name=client_project_name,
+        labels=parsed_labels,
         items=parsed_items,
         file_path=file_path
     )
