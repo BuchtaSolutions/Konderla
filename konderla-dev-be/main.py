@@ -18,6 +18,29 @@ import pdf_export
 from fastapi.responses import FileResponse
 from datetime import datetime, timezone
 
+# --- Totals ---
+def _compute_budget_total_price(items, include_subsections: bool = False) -> float:
+    if not isinstance(items, list):
+        return 0.0
+
+    def _as_float(v) -> float:
+        try:
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    dict_items = [it for it in items if isinstance(it, dict)]
+    if include_subsections:
+        # Requested behavior for some Type2 files: count parent + subsection rows together.
+        base = dict_items
+    else:
+        section_items = [it for it in dict_items if it.get("is_section_header") is True]
+        base = section_items if section_items else dict_items
+    total = sum(_as_float(it.get("price")) for it in base)
+    if total != total or total in (float("inf"), float("-inf")):
+        return 0.0
+    return round(total, 2)
+
 # Load environment variables
 # Try loading from standard locations
 if os.path.exists('/.env'):
@@ -181,8 +204,30 @@ async def upload_budget_excel(
             if offer_last_changed_at and offer_last_changed_at.strip()
             else datetime.now(timezone.utc).isoformat()
         )
-        if data.get("type") == "type3" and parent_info.get("total_price") is not None:
-            parent_labels["total_price"] = parent_info["total_price"]
+        # Always store a safe total_price for UI (prevents double counting across Excel variants).
+        computed_total = _compute_budget_total_price(
+            parent_info.get("items"),
+            include_subsections=(data.get("type") == "type2"),
+        )
+        if computed_total > 0:
+            parent_labels["total_price"] = computed_total
+
+        # If parser extracted explicit totals (e.g. some Type3), store informational with-VAT value.
+        extracted_total = parent_info.get("total_price")
+        extracted_total_with_vat = parent_info.get("total_price_with_vat")
+        if isinstance(extracted_total_with_vat, (int, float)) and extracted_total_with_vat > 0:
+            parent_labels["total_price_with_vat"] = round(float(extracted_total_with_vat), 2)
+        if data.get("type") == "type1" and isinstance(extracted_total, (int, float)) and extracted_total > 0:
+            # Type1 now runs in no-DPH mode.
+            parent_labels["total_price"] = round(float(extracted_total), 2)
+
+        # Trust extracted total only when close to computed_total.
+        # This keeps CELKOVÁ CENA on the same basis as visible item rows.
+        if data.get("type") != "type1" and isinstance(extracted_total, (int, float)) and extracted_total > 0 and computed_total > 0:
+            diff = abs(float(extracted_total) - float(computed_total))
+            rel = diff / max(float(computed_total), 1.0)
+            if rel <= 0.02:  # within 2%
+                parent_labels["total_price"] = round(float(extracted_total), 2)
         parent_budget = models.Budget(
             project_id=project_id,
             round_id=round_id,
@@ -599,4 +644,28 @@ async def export_round_pdf(round_id: UUID, db: Session = Depends(get_db)):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {str(e)}")
+
+
+# PDF Export - Summary (Souhrn kol)
+@app.get("/projects/{project_id}/export-summary-pdf")
+async def export_project_summary_pdf(project_id: UUID, db: Session = Depends(get_db)):
+    """Exportuje souhrn vývoje cen mezi koly do PDF."""
+    try:
+        output_dir = "uploads/exports"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"summary_{project_id}.pdf")
+
+        pdf_export.generate_summary_pdf_export(project_id, db, output_path)
+
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            filename=f"souhrn_kol_export_{project_id}.pdf",
+        )
+    except Exception as e:
+        print(f"Summary PDF export error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate summary PDF: {str(e)}")
 

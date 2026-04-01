@@ -44,20 +44,17 @@ def _looks_like_formula_or_continuation(name: str) -> bool:
     if not s or len(s) < 2:
         return True
     lower = s.lower()
-    # Vzorce s operátory - pouze pokud jsou mezi čísly (např. "7,50*1,50" nebo "10/2")
-    # "/" nebo "*" mezi slovy (např. "podloží / pláně") NENÍ vzorec
-    if "*" in s:
-        # Pokud obsahuje "*", zkontroluj, jestli je to vzorec (čísla kolem *)
-        if re.search(r'\d[^\w]*\*[^\w]*\d', s.replace(" ", "")):
+    # Vzorce bereme jen když celý řetězec vypadá jako čistý numerický výraz
+    # (např. "7,50*1,50", "10/2"), nikoliv textové názvy obsahující "C 25/30".
+    if "*" in s or "/" in s:
+        has_letters = bool(re.search(r"[A-Za-zÁ-ž]", s))
+        looks_expression = bool(
+            re.fullmatch(r"[\d\s,.\-+*/()xX]+", s)
+            and re.search(r"\d", s)
+            and re.search(r"[*/]", s)
+        )
+        if looks_expression and not has_letters:
             return True
-    if "/" in s:
-        # Pokud obsahuje "/", zkontroluj, jestli je to vzorec (čísla kolem / bez mezer nebo s písmeny)
-        # Ale "/" mezi slovy s mezerami (např. "podloží / pláně") není vzorec
-        # Vzorec by měl být něco jako "7,50/2" nebo "10/5" bez mezer kolem /
-        if re.search(r'\d[^\w\s]*/[^\w\s]*\d', s.replace(" ", "")):
-            # Ale pokud je "/" mezi písmeny nebo slovy s mezerami, není to vzorec
-            if not re.search(r'[a-zA-Zá-žÁ-Ž]\s*/\s*[a-zA-Zá-žÁ-Ž]', s):
-                return True
     # Čistá čísla (ale ne pokud je to část názvu jako "SO 1000")
     if re.match(r"^[\d\s,.\-]+$", s) and len(s) > 2 and "so" not in lower:
         return True
@@ -328,7 +325,7 @@ def find_header_row(df: pd.DataFrame, prefer_celkem_for_price: bool = False) -> 
         row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
 
         current_mapping = {}
-        price_candidates = []  # (col_i, has_celkem)
+        price_candidates = []  # (col_i, has_celkem, is_without_vat, is_with_vat)
 
         for col_i, val in enumerate(row.values):
             val_str = str(val).lower()
@@ -341,17 +338,41 @@ def find_header_row(df: pd.DataFrame, prefer_celkem_for_price: bool = False) -> 
             if 'name' not in current_mapping and any(k in val_str for k in kw_name) and "měrná" not in val_str:
                 current_mapping['name'] = col_i
 
-            if any(k in val_str for k in kw_price) and "dph" not in val_str:
+            if any(k in val_str for k in kw_price):
+                is_without_vat = ("bez dph" in val_str) or ("bezdph" in val_str)
+                is_with_vat = (
+                    ("s dph" in val_str)
+                    or ("vč dph" in val_str)
+                    or ("vc dph" in val_str)
+                    or ("včetně dph" in val_str)
+                    or ("vcetne dph" in val_str)
+                )
+                # Keep candidates even with DPH text, we may need fallback when no better column exists.
                 has_celkem = "celkem" in val_str and "cena" not in val_str
-                price_candidates.append((col_i, has_celkem))
+                price_candidates.append((col_i, has_celkem, is_without_vat, is_with_vat))
 
         if price_candidates:
             if prefer_celkem_for_price:
-                # Prefer column that is "Celkem" (total), not "Cena / MJ" (unit price)
-                celkem_cols = [c for c, has_celkem in price_candidates if has_celkem]
-                current_mapping['price'] = celkem_cols[0] if celkem_cols else price_candidates[0][0]
+                # Prefer no-DPH total when available.
+                no_dph_celkem_cols = [c for c, has_celkem, is_without_vat, _ in price_candidates if has_celkem and is_without_vat]
+                if no_dph_celkem_cols:
+                    current_mapping['price'] = no_dph_celkem_cols[0]
+                else:
+                    # Then prefer total column that is not explicitly with DPH.
+                    celkem_non_with_dph_cols = [c for c, has_celkem, _, is_with_vat in price_candidates if has_celkem and not is_with_vat]
+                    if celkem_non_with_dph_cols:
+                        current_mapping['price'] = celkem_non_with_dph_cols[0]
+                    else:
+                        celkem_cols = [c for c, has_celkem, _, _ in price_candidates if has_celkem]
+                        current_mapping['price'] = celkem_cols[0] if celkem_cols else price_candidates[0][0]
             else:
-                current_mapping['price'] = price_candidates[0][0]
+                # Generic mode: prefer no-DPH column first.
+                no_dph_cols = [c for c, _, is_without_vat, _ in price_candidates if is_without_vat]
+                if no_dph_cols:
+                    current_mapping['price'] = no_dph_cols[0]
+                else:
+                    non_with_dph_cols = [c for c, _, _, is_with_vat in price_candidates if not is_with_vat]
+                    current_mapping['price'] = non_with_dph_cols[0] if non_with_dph_cols else price_candidates[0][0]
 
         score = 0
         if 'name' in current_mapping:
@@ -1026,11 +1047,31 @@ def process_type_1(xls: pd.ExcelFile, filename: str, provided_name: Optional[str
 
     project_name = provided_name if provided_name else filename.rsplit('.', 1)[0]
 
+    total_price_without_vat: Optional[float] = None
+    total_price_with_vat: Optional[float] = None
+
     if main_sheet_name in xls.sheet_names:
         df_stavba = pd.read_excel(xls, sheet_name=main_sheet_name)
         if not provided_name:
             project_name_extracted = extract_project_name(df_stavba)
             if project_name_extracted: project_name = project_name_extracted
+
+        # Parse explicit totals from Stavba sheet:
+        # - "Cena celkem bez DPH" (preferred as CELKOVÁ CENA in UI)
+        # - "Cena celkem s DPH" (stored for optional display)
+        for idx in range(min(len(df_stavba), 220)):
+            row = df_stavba.iloc[idx]
+            row_text = " ".join(str(x).lower() for x in row.values if pd.notna(x))
+            if "cena celkem bez dph" in row_text:
+                vals = [clean_price(v) for v in row.values if pd.notna(v)]
+                vals = [v for v in vals if v > 1000]
+                if vals:
+                    total_price_without_vat = max(vals)
+            if "cena celkem s dph" in row_text:
+                vals = [clean_price(v) for v in row.values if pd.notna(v)]
+                vals = [v for v in vals if v > 1000]
+                if vals:
+                    total_price_with_vat = max(vals)
         
         # We look for specific sections: "Rekapitulace dílčích částí" ONLY
         # Logic: Find the row defining the section, then find the header row below it.
@@ -1057,6 +1098,8 @@ def process_type_1(xls: pd.ExcelFile, filename: str, provided_name: Optional[str
             if active_section:
                 header_row_idx = -1
                 col_map = {}
+                base_low_col = -1
+                base_high_col = -1
 
                 for j in range(i + 1, min(i + 6, len(df_stavba))):
                     r_head = df_stavba.iloc[j]
@@ -1072,6 +1115,10 @@ def process_type_1(xls: pd.ExcelFile, filename: str, provided_name: Optional[str
                                 col_map['name'] = col_idx
                             elif "cena celkem" in val_str:
                                 col_map['price'] = col_idx
+                            elif "základ pro sníženou dph" in val_str or "zaklad pro snizenou dph" in val_str:
+                                base_low_col = col_idx
+                            elif "základ pro základní dph" in val_str or "zaklad pro zakladni dph" in val_str:
+                                base_high_col = col_idx
                         break
 
                 if header_row_idx != -1 and 'name' in col_map and 'price' in col_map:
@@ -1094,27 +1141,62 @@ def process_type_1(xls: pd.ExcelFile, filename: str, provided_name: Optional[str
                         if 'number' in col_map and pd.notna(r_item.iloc[col_map['number']]):
                             code = str(r_item.iloc[col_map['number']]).strip()
 
+                        # Type 1 Stavba: "Rekapitulace dílčích částí" often contains hierarchy levels (1/2/3)
+                        # where level 2 are the real objects (SO/IO) and level 3 are sub-objects or internal budgets.
+                        # Level 3 rows like "D.1.1" repeat under multiple objects and must NOT become top-level items.
+                        level_val = r_item.iloc[0] if len(r_item.values) > 0 else None
+                        level = None
+                        try:
+                            if pd.notna(level_val):
+                                if isinstance(level_val, (int, float)):
+                                    level = int(level_val)
+                                else:
+                                    s = str(level_val).strip()
+                                    if s.isdigit():
+                                        level = int(s)
+                        except Exception:
+                            level = None
+
+                        code_upper = (code or "").strip().upper()
+                        if level == 3 and code_upper.startswith("D."):
+                            continue
+
+                        # Ignore non-object rows like "Stavba" (they are totals/containers)
+                        if not code or not _is_subsheet_code(code):
+                            continue
+
                         item_id = f"{code}|{name}"
                         if item_id in parsed_codes:
                             continue
 
+                        # Type1 should use prices WITHOUT DPH.
+                        # Prefer explicit base columns from Stavba rekapitulace:
+                        #   základ pro sníženou DPH + základ pro základní DPH
                         price = 0.0
-                        if 'price' in col_map and pd.notna(r_item.iloc[col_map['price']]):
-                            price = clean_price(r_item.iloc[col_map['price']])
-                        else:
-                            vals = [x for x in r_item.values if pd.notna(x)]
-                            if vals:
-                                try:
-                                    price = clean_price(vals[-1])
-                                except Exception:
-                                    pass
+                        if base_low_col >= 0 and base_low_col < len(r_item):
+                            price += clean_price(r_item.iloc[base_low_col])
+                        if base_high_col >= 0 and base_high_col < len(r_item):
+                            price += clean_price(r_item.iloc[base_high_col])
+
+                        # Fallback to "Cena celkem" if base columns are unavailable in this template.
+                        if price <= 0:
+                            if 'price' in col_map and pd.notna(r_item.iloc[col_map['price']]):
+                                price = clean_price(r_item.iloc[col_map['price']])
+                            else:
+                                vals = [x for x in r_item.values if pd.notna(x)]
+                                if vals:
+                                    try:
+                                        price = clean_price(vals[-1])
+                                    except Exception:
+                                        pass
 
                         if price > 0 or (code and len(name) > 2):
                             parent_items.append({
                                 "number": code,
                                 "name": name,
                                 "price": price,
-                                "is_section_header": True,
+                                # Only level-2 objects contribute to total; level-3 sub-objects are shown but excluded
+                                "is_section_header": level != 3,
                             })
                             parsed_codes.add(item_id)
 
@@ -1168,12 +1250,18 @@ def process_type_1(xls: pd.ExcelFile, filename: str, provided_name: Optional[str
             if len(budget_data["items"]) > 0:
                 child_budgets.append(budget_data)
 
+    parent_budget_payload = {
+        "name": project_name,
+        "items": parent_items,
+    }
+    if total_price_without_vat and total_price_without_vat > 0:
+        parent_budget_payload["total_price"] = round(float(total_price_without_vat), 2)
+    if total_price_with_vat and total_price_with_vat > 0:
+        parent_budget_payload["total_price_with_vat"] = round(float(total_price_with_vat), 2)
+
     return {
         "type": "type1",
-        "parent_budget": {
-            "name": project_name,
-            "items": parent_items
-        },
+        "parent_budget": parent_budget_payload,
         "child_budgets": child_budgets
     }
 
