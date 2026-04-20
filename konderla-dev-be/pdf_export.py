@@ -1,6 +1,6 @@
 from reportlab.lib import colors, utils as rl_utils
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.units import mm, inch
+from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
@@ -11,13 +11,23 @@ from reportlab.pdfbase.ttfonts import TTFont
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
-matplotlib.rcParams["font.family"] = "DejaVu Sans"
-matplotlib.rcParams["font.weight"] = "regular"
+from matplotlib import font_manager as _mpl_font_manager
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+# Výchozí styl; stejný TTF jako PDF se doplní v _ensure_matplotlib_chart_font().
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans", "DejaVu Sans Display", "Arial", "Helvetica"]
+matplotlib.rcParams["font.weight"] = "normal"
 matplotlib.rcParams["axes.titleweight"] = "semibold"
-matplotlib.rcParams["axes.labelweight"] = "regular"
+matplotlib.rcParams["axes.labelweight"] = "normal"
+matplotlib.rcParams["axes.unicode_minus"] = False
+matplotlib.rcParams["axes.formatter.useoffset"] = False
+matplotlib.rcParams["axes.formatter.use_mathtext"] = False
 import io
 import os
 import hashlib
+import html
+import math
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy.orm import Session
@@ -37,6 +47,120 @@ _CHART_PALETTE = [
 ]
 _PIE_MAX_SLICES = 8
 _PIE_MIN_PERCENT = 1.0
+# Patička: větší odsazení od spodu (dřív ~15 mm + 4 px bylo u dlouhého textu u řezu)
+_FOOTER_LINE_Y = 31 * mm
+_FOOTER_FIRST_LINE_Y = 22 * mm
+_FOOTER_SIGNATURE_Y = 23.8 * mm
+_FOOTER_OWNER_NAME_Y = 21.1 * mm
+_FOOTER_OWNER_REST_Y = 18.0 * mm
+
+# Grafy v PDF: jednotná typografie (větší body = čitelné po zmenšení do šablony A4)
+_CHART_DPI = 360
+_CHART_FS_AXIS = 14
+_CHART_FS_TICK = 13
+_CHART_FS_LEGEND = 12
+_CHART_FS_BAR_VALUE = 13
+# Jedno plátno pro koláč i sloupec; nižší výška = méně místa ve flow PDF (1. strana)
+_CHART_FIGSIZE = (10.8, 8.6)
+_MPL_FONT_SYNCED = False
+
+
+def _find_czech_font_ttf_paths() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Stejné cesty jako při registraci TTFont pro ReportLab — aby Matplotlib kreslil
+    stejným písmem jako text v PDF.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        os.path.join(base, "static", "DejaVuSans.ttf"),
+        os.path.join(base, "fonts", "DejaVuSans.ttf"),
+        "/Library/Fonts/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        bold_path = path.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf").replace(
+            "LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"
+        )
+        bold_final = bold_path if os.path.isfile(bold_path) else None
+        return path, bold_final
+    return None, None
+
+
+def _ensure_matplotlib_chart_font() -> None:
+    """Nastaví Matplotlib na stejný TTF soubor jako ReportLab (_CZECH_FONT)."""
+    global _MPL_FONT_SYNCED
+    if _MPL_FONT_SYNCED:
+        return
+    regular, bold = _find_czech_font_ttf_paths()
+    if regular:
+        try:
+            _mpl_font_manager.fontManager.addfont(regular)
+            prop = _mpl_font_manager.FontProperties(fname=regular)
+            fam = prop.get_name()
+            matplotlib.rcParams["font.family"] = [fam]
+            matplotlib.rcParams["font.sans-serif"] = [fam, "DejaVu Sans", "Arial", "Helvetica"]
+        except Exception:
+            matplotlib.rcParams["font.family"] = "sans-serif"
+            matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
+        if bold:
+            try:
+                _mpl_font_manager.fontManager.addfont(bold)
+            except Exception:
+                pass
+    _MPL_FONT_SYNCED = True
+
+
+def _format_kc_space(value: float) -> str:
+    return f"{int(round(value)):,.0f}".replace(",", " ")
+
+
+def _format_price_chart_label(kc: float) -> str:
+    """Krátký popisek ceny: u velkých částek mil. Kč, jinak celé Kč."""
+    if abs(kc) >= 1_000_000.0:
+        return f"{kc / 1_000_000.0:.2f} mil. Kč".replace(".", ",")
+    return f"{_format_kc_space(kc)} Kč"
+
+
+def _chart_font_prop(size: float, *, bold: bool = False):
+    """
+    Jedno písmo pro celý graf (stejný TTF jako PDF). Legenda u koláče i osy u sloupců
+    tak nepoužívají jiný fallback než nadpis.
+    """
+    reg, bold_path = _find_czech_font_ttf_paths()
+    path_used = bold_path if (bold and bold_path and os.path.isfile(bold_path)) else reg
+    if path_used and os.path.isfile(path_used):
+        return _mpl_font_manager.FontProperties(fname=path_used, size=size)
+    fam = (matplotlib.rcParams.get("font.sans-serif") or ["DejaVu Sans"])[0]
+    return _mpl_font_manager.FontProperties(
+        family=fam,
+        size=size,
+        weight="bold" if bold else "normal",
+    )
+
+
+def _plain_y_formatter_mil(v: float, _pos: Optional[int]) -> str:
+    """Ticky na ose Y v mil. Kč — vždy běžné číslo, žádné 1e…"""
+    if v != v or math.isinf(v):  # nan / inf
+        return ""
+    return f"{float(v):.2f}"
+
+
+def _plain_y_formatter_tis(v: float, _pos: Optional[int]) -> str:
+    if v != v or math.isinf(v):
+        return ""
+    return f"{v:,.0f}".replace(",", " ")
+
+
+def _hide_axis_offset_text(ax) -> None:
+    for axis in (ax.xaxis, ax.yaxis):
+        ot = axis.get_offset_text()
+        ot.set_visible(False)
+        ot.set_text("")
 
 
 def _palette_index(label: str) -> int:
@@ -174,7 +298,7 @@ def _prepare_pie_entries(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     for item in items:
         name = (item.get("name") or "Neznámá položka").strip()
-        price = float(item.get("price", 0) or 0)
+        price = _parse_price_fe(item.get("price")) or 0.0
         if price > 0:
             entries.append({"name": name, "price": price, "color_key": name})
 
@@ -188,37 +312,19 @@ def _register_czech_font() -> None:
     global _CZECH_FONT, _CZECH_FONT_BOLD
     if _CZECH_FONT != "Helvetica":
         return
-    base = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        # Debian/Ubuntu (fonts-dejavu-core)
-        ("DejaVuSans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        ("DejaVuSans", "/usr/share/fonts/TTF/DejaVuSans.ttf"),
-        # Projekt / static
-        ("DejaVuSans", os.path.join(base, "static", "DejaVuSans.ttf")),
-        ("DejaVuSans", os.path.join(base, "fonts", "DejaVuSans.ttf")),
-        # macOS
-        ("DejaVuSans", "/Library/Fonts/DejaVuSans.ttf"),
-        ("DejaVuSans", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
-        # Fallback: Liberation Sans (často na RHEL/Fedora)
-        ("DejaVuSans", "/usr/share/fonts/liberation/LiberationSans-Regular.ttf"),
-    ]
-    for name, path in candidates:
-        if os.path.isfile(path):
-            try:
-                pdfmetrics.registerFont(TTFont("DejaVuSans", path))
-                # Bold varianta – DejaVu nebo Liberation
-                bold_path = path.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf").replace(
-                    "LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"
-                )
-                if os.path.isfile(bold_path):
-                    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_path))
-                    _CZECH_FONT_BOLD = "DejaVuSans-Bold"
-                else:
-                    _CZECH_FONT_BOLD = "DejaVuSans"
-                _CZECH_FONT = "DejaVuSans"
-                break
-            except Exception:
-                continue
+    path, bold_path = _find_czech_font_ttf_paths()
+    if not path:
+        return
+    try:
+        pdfmetrics.registerFont(TTFont("DejaVuSans", path))
+        if bold_path:
+            pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_path))
+            _CZECH_FONT_BOLD = "DejaVuSans-Bold"
+        else:
+            _CZECH_FONT_BOLD = "DejaVuSans"
+        _CZECH_FONT = "DejaVuSans"
+    except Exception:
+        pass
 
 
 def _logo_image_with_aspect(path: str, max_w: float, max_h: float):
@@ -256,6 +362,150 @@ def _find_logo_path() -> Optional[str]:
         if os.path.isfile(p):
             return p
     return None
+
+
+def _is_js_number(value: Any) -> bool:
+    """Odpovídá `typeof x === 'number'` ve frontendu (včetně Decimal z DB, ne bool)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    try:
+        from decimal import Decimal
+
+        return isinstance(value, Decimal)
+    except ImportError:
+        return False
+
+
+def _parse_price_fe(value: Any) -> Optional[float]:
+    """Stejné jako `parsePrice` v konderla-dev-fe/pages/projects/[id].tsx (RoundView)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if _is_js_number(value):
+        v = float(value)
+        return v if math.isfinite(v) else None
+    raw = str(value).strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if math.isfinite(v) else None
+    except ValueError:
+        return None
+
+
+def _get_budget_items_fe(budget: Any) -> List[Dict[str, Any]]:
+    """Stejné jako `getBudgetItemsSafe` na stránce projektu (pole nebo `items.list`)."""
+    items = getattr(budget, "items", None)
+    if isinstance(items, list):
+        return [i for i in items if isinstance(i, dict)]
+    if isinstance(items, dict):
+        maybe_list = items.get("list")
+        if isinstance(maybe_list, list):
+            return [i for i in maybe_list if isinstance(i, dict)]
+    return []
+
+
+def _truncate_ellipsis(text: str, max_len: int) -> str:
+    """Zkrátí řetězec na max_len znaků a na konec doplní ... pokud byl delší."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if max_len <= 0:
+        return ""
+    if len(t) <= max_len:
+        return t
+    if max_len <= 3:
+        return "." * max_len
+    return t[: max_len - 3].rstrip() + "..."
+
+
+# Titulky grafů a hlavičky sloupců rozpočtu v PDF — ať se dlouhé názvy vejdou.
+_CHART_TITLE_MAX_LEN = 52
+_TABLE_BUDGET_COL_MAX_LEN = 30
+
+
+def _budget_display_name(budget: Any, *, empty_fallback: str = "Bez názvu") -> str:
+    """Název firmy (`client_name`) má přednost před technickým názvem rozpočtu (`name`)."""
+    cn = (getattr(budget, "client_name", None) or "").strip()
+    if cn:
+        return cn
+    n = (getattr(budget, "name", None) or "").strip()
+    return n or empty_fallback
+
+
+def _budget_chart_title(budget: Any, *, empty_fallback: str = "Rozpočet") -> str:
+    """Titulek grafu: technický název rozpočtu / souboru (`name`), ne název firmy — se zkrácením."""
+    n = (getattr(budget, "name", None) or "").strip()
+    raw = n or empty_fallback
+    return _truncate_ellipsis(raw, _CHART_TITLE_MAX_LEN)
+
+
+def _label_total_price_if_js_number(budget: Any) -> Optional[float]:
+    """Hodnota `labels.total_price` jen pokud je numerická (jako `typeof === 'number'` v TS)."""
+    labels = getattr(budget, "labels", None)
+    if not isinstance(labels, dict):
+        return None
+    tp = labels.get("total_price")
+    if not _is_js_number(tp):
+        return None
+    v = float(tp)
+    return v if math.isfinite(v) else None
+
+
+def _summary_item_price_or_zero(price: Any) -> float:
+    """Odpovídá `(item?.price || 0)` v `getBudgetTotalPriceSafe` (s numerickým parsováním řetězců)."""
+    if price is None or price is False or price == "":
+        return 0.0
+    if _is_js_number(price):
+        return float(price)
+    if isinstance(price, str):
+        return _parse_price_fe(price) or 0.0
+    return 0.0
+
+
+def budget_total_summary_tab(budget: Any) -> float:
+    """
+    Stejné jako `getBudgetTotalPriceSafe` v ProjectDetail (záložka Souhrn kol):
+    numerické `labels.total_price`, jinak součet položek `(item?.price || 0)`.
+    """
+    labeled = _label_total_price_if_js_number(budget)
+    if labeled is not None:
+        return labeled
+    return sum(_summary_item_price_or_zero(item.get("price")) for item in _get_budget_items_fe(budget))
+
+
+def budget_total_round_celek_row(budget: Any) -> float:
+    """
+    Stejné jako řádek „CELKOVÁ CENA“ v RoundView: numerické `labels.total_price`,
+    jinak součet `parsePrice(item.price) || 0` přes položky.
+    """
+    labeled = _label_total_price_if_js_number(budget)
+    if labeled is not None:
+        return labeled
+    return sum(
+        _parse_price_fe(item.get("price")) or 0.0 for item in _get_budget_items_fe(budget)
+    )
+
+
+def _chart_item_rows(budget: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Výběr řádků pro koláč / sloupce: stejná idea jako `main._compute_budget_total_price`.
+    Když je v rozpočtu číselné `labels.total_price` (typicky import/type1), počítají se jen
+    řádky sekcí — ne všechny dílčí položky, aby součet ve grafu nebyl nafouknutý oproti
+    „CELKOVÁ CENA“. Bez číselného labelu bereme všechny řádky jako při fallbacku ve webové tabulce.
+    """
+    dict_items = [i for i in items if isinstance(i, dict)]
+    if not dict_items:
+        return []
+    if _label_total_price_if_js_number(budget) is not None:
+        # Stejně jako main._compute_budget_total_price – jen skutečné sekční hlavičky
+        section_items = [it for it in dict_items if it.get("is_section_header") is True]
+        return section_items if section_items else dict_items
+    return dict_items
 
 
 class PDFCanvas(canvas.Canvas):
@@ -327,15 +577,13 @@ class PDFCanvas(canvas.Canvas):
             except Exception:
                 pass
 
-        footer_top_y = 24 * mm
+        footer_top_y = _FOOTER_LINE_Y
         self.line(15 * mm, footer_top_y, page_w - 15 * mm, footer_top_y)
 
         # Levá část patičky: logo + firemní info
         left_x = 15 * mm
         if self.company_lines:
-            first_line_y = 15.0 * mm
-            # Držet spodní odsazení patičky cca 8 mm od spodku stránky.
-            first_line_y = max(first_line_y, 15.0 * mm)
+            first_line_y = _FOOTER_FIRST_LINE_Y
             self.setFillColor(HexColor("#111827"))
             header_text = self.beginText()
             header_text.setTextOrigin(left_x, first_line_y)
@@ -368,7 +616,7 @@ class PDFCanvas(canvas.Canvas):
                     self.drawImage(
                         self.signature_path,
                         right_x - w,
-                        16.8 * mm,
+                        _FOOTER_SIGNATURE_Y,
                         width=w,
                         height=h,
                         preserveAspectRatio=True,
@@ -379,10 +627,10 @@ class PDFCanvas(canvas.Canvas):
 
         self.setFillColor(HexColor("#111827"))
         self.setFont(_CZECH_FONT_BOLD, 8.4)
-        self.drawRightString(right_x, 14.1 * mm, self.owner_name)
+        self.drawRightString(right_x, _FOOTER_OWNER_NAME_Y, self.owner_name)
         self.setFont(_CZECH_FONT, 7.7)
         self.setFillColor(HexColor("#374151"))
-        right_line_y = 11.0 * mm
+        right_line_y = _FOOTER_OWNER_REST_Y
         if self.owner_title:
             self.drawRightString(right_x, right_line_y, self.owner_title)
             right_line_y -= 3.0 * mm
@@ -397,17 +645,29 @@ class PDFCanvas(canvas.Canvas):
         super().showPage()
 
 
+_GAP_SLICE_NAME = "Rozdíl k celkové ceně"
+_GAP_COLOR = "#94a3b8"
+_PIE_TOTAL_EPS = 0.5
+
+
 def create_pie_chart(
     items: List[Dict[str, Any]],
+    budget: Any,
     budget_name: str,
     output_path: str,
     color_map: Optional[Dict[str, str]] = None,
+    total_display: Optional[float] = None,
 ):
-    """Vytvoří moderní koláčový graf pro budget"""
+    """
+    Koláč pro rozpočet. Řádky vycházejí z _chart_item_rows (sekce vs. všechny řádky).
+    Střed a součet řezů odpovídají řádku „CELKOVÁ CENA“ (total_display).
+    Pokud je celková cena vyšší než součet řezů, přidá se šedý řez „Rozdíl k celkové ceně“.
+    """
     if not items:
         return None
-    
-    entries = _prepare_pie_entries(items)
+
+    row_items = _chart_item_rows(budget, items)
+    entries = _prepare_pie_entries(row_items)
     if not entries:
         return None
 
@@ -424,14 +684,35 @@ def create_pie_chart(
         else:
             entries = entries[:max_items]
 
+    sum_slices = float(sum(e["price"] for e in entries))
+    td = total_display
+    if td is not None and td > sum_slices + _PIE_TOTAL_EPS:
+        entries.append(
+            {
+                "name": _GAP_SLICE_NAME,
+                "price": td - sum_slices,
+                "color_key": "__budget_gap__",
+            }
+        )
+    elif td is not None and td + _PIE_TOTAL_EPS < sum_slices:
+        # Nepodporovaný rozpor (label < součet položek): střed sjednotíme se součtem řezů
+        td = None
+
+    _ensure_matplotlib_chart_font()
+
     prices = [e["price"] for e in entries]
-    color_keys = [str(e["color_key"]) for e in entries]
-    colors_list = [_color_for_label_mapped(k, color_map) for k in color_keys]
+    colors_list = []
+    for e in entries:
+        if e.get("color_key") == "__budget_gap__":
+            colors_list.append(_GAP_COLOR)
+        else:
+            colors_list.append(_color_for_label_mapped(str(e.get("color_key", e.get("name"))), color_map))
     
-    # Donut chart ve stylu dashboardu.
-    fig, ax = plt.subplots(figsize=(9.8, 8.8), facecolor='white')
-    ax.set_facecolor('white')
-    
+    fig_w, fig_h = _CHART_FIGSIZE
+    fig, ax = plt.subplots(figsize=_CHART_FIGSIZE, facecolor="white")
+    ax.set_facecolor("white")
+
+    # Vnitřek donutu: původní vzhled (velikosti / celé Kč ve středu), ne zjednodušené „mil. Kč“.
     wedges, _, autotexts = ax.pie(
         prices,
         labels=None,
@@ -443,16 +724,14 @@ def create_pie_chart(
         pctdistance=0.75,
         radius=1.05,
     )
+    ax.set_aspect("equal")
     for autotext in autotexts:
         autotext.set_color('white')
         autotext.set_fontweight('bold')
         autotext.set_fontsize(11)
-    
-    # Název rozpočtu nekrátit, ať je vždy vidět celý.
-    ax.set_title((budget_name or "Rozpočet").strip(), fontsize=14, fontweight='semibold', pad=14, color='#111827')
 
-    # Celková hodnota doprostřed donutu.
-    total_price_value = sum(prices)
+    # Celková hodnota doprostřed donutu = stejná logika jako „CELKOVÁ CENA“ (ne jen součet řezů před doplňkem).
+    total_price_value = float(td) if td is not None else float(sum(prices))
     ax.text(
         0,
         0,
@@ -464,38 +743,42 @@ def create_pie_chart(
         color='#1f2937',
     )
 
-    # Legenda nahoře jako v dashboard přehledech.
+    # Legenda: procenta vůči stejnému celku jako střed donutu
     legend_labels = []
-    total_price = sum(prices) if prices else 0
+    denom = total_price_value if total_price_value > 0 else (sum(prices) if prices else 0.0)
     for e in entries:
         label_name = (e["name"] or "").strip()
         if len(label_name) > 34:
             label_name = label_name[:34] + "..."
         label = label_name
-        if total_price > 0:
-            pct = (e["price"] / total_price) * 100.0
+        if denom > 0:
+            pct = (e["price"] / denom) * 100.0
             label = f"{label} ({pct:.1f} %)"
         legend_labels.append(label)
-    # Fixní plocha pro donut, legenda je mimo osu (na úrovni figury),
-    # aby dlouhá legenda nezmenšovala samotný graf.
-    ax.set_position([0.10, 0.28, 0.80, 0.66])
+    # Čtverec v palcích: w*h_fig == h*w_fig → kruh při obdélníkovém plátně
+    h_frac = 0.48
+    w_frac = h_frac * (fig_h / fig_w)
+    left = (1.0 - w_frac) / 2.0
+    ax.set_position([left, 0.26, w_frac, h_frac])
     fig.legend(
         wedges,
         legend_labels,
         loc="lower center",
         bbox_to_anchor=(0.5, 0.02),
         frameon=False,
-        fontsize=11.0,
         ncol=2,
         handlelength=1.6,
         labelspacing=0.55,
         handletextpad=0.6,
         columnspacing=1.1,
+        prop=_chart_font_prop(_CHART_FS_LEGEND, bold=False),
     )
-    ax.axis('equal')
+    ax.set_aspect("equal")
 
-    fig.subplots_adjust(bottom=0.22, top=0.90)
-    plt.savefig(output_path, dpi=320, facecolor='white', edgecolor='none')
+    # Nadpis rozpočtu je v PDF (ReportLab), ne zde — víc místa pro graf
+    fig.subplots_adjust(bottom=0.22, top=0.96)
+    _ = budget_name
+    plt.savefig(output_path, dpi=_CHART_DPI, facecolor="white", edgecolor="none")
     plt.close()
     
     return output_path
@@ -503,38 +786,63 @@ def create_pie_chart(
 
 def create_bar_chart(
     items: List[Dict[str, Any]],
+    budget: Any,
     budget_name: str,
     output_path: str,
     color_map: Optional[Dict[str, str]] = None,
 ):
-    """Vytvoří sloupcový graf (TOP položky dle ceny) pro budget."""
+    """Vytvoří sloupcový graf (TOP položky dle ceny) — stejná báze řádků jako koláč."""
     if not items:
         return None
 
+    row_items = _chart_item_rows(budget, items)
     rows = []
-    for item in items:
+    for item in row_items:
         name = (item.get("name") or "Neznámá položka").strip()
-        price = float(item.get("price", 0) or 0)
+        price = _parse_price_fe(item.get("price")) or 0.0
         if price > 0:
             rows.append((name, price))
 
     if not rows:
         return None
 
+    _ensure_matplotlib_chart_font()
+
     # TOP 8 položek podle ceny
     rows.sort(key=lambda x: x[1], reverse=True)
     rows = rows[:8]
     names = [n[:28] + ("..." if len(n) > 28 else "") for n, _ in rows]
     prices = [p for _, p in rows]
+    max_p = max(prices) if prices else 0.0
+    if max_p < 1_000_000.0:
+        y_values = [p / 1_000.0 for p in prices]
+        y_unit = "tis. Kč"
+        y_formatter = _plain_y_formatter_tis
+    else:
+        y_values = [p / 1_000_000.0 for p in prices]
+        y_unit = "mil. Kč"
+        y_formatter = _plain_y_formatter_mil
 
-    # Větší canvas + vyšší DPI kvůli ostrosti při velkém zobrazení v PDF.
-    fig, ax = plt.subplots(figsize=(10.8, 6.6), facecolor="white")
+    fig, ax = plt.subplots(figsize=_CHART_FIGSIZE, facecolor="white")
     bar_colors = [_color_for_label_mapped(n, color_map) for n, _ in rows]
-    bars = ax.bar(range(len(prices)), prices, color=bar_colors, edgecolor="#334155", linewidth=0.45)
+    bars = ax.bar(
+        range(len(y_values)),
+        y_values,
+        width=0.82,
+        color=bar_colors,
+        edgecolor="#334155",
+        linewidth=0.45,
+    )
 
     ax.set_xticks(range(len(names)))
-    ax.set_xticklabels(names, rotation=24, ha="right", fontsize=15, color="#334155")
-    ax.tick_params(axis="y", labelsize=15, colors="#475569")
+    ax.set_xticklabels(names, rotation=24, ha="right", rotation_mode="anchor", color="#334155")
+    for _lbl in ax.get_xticklabels():
+        _lbl.set_fontproperties(_chart_font_prop(_CHART_FS_TICK))
+        _lbl.set_clip_on(False)
+    ax.tick_params(axis="y", colors="#475569")
+    ax.tick_params(axis="x", colors="#334155", pad=8)
+    for _lbl in ax.get_yticklabels():
+        _lbl.set_fontproperties(_chart_font_prop(_CHART_FS_TICK))
     ax.grid(axis="y", color="#e2e8f0", linewidth=0.8)
     ax.set_axisbelow(True)
     for spine in ("top", "right"):
@@ -542,26 +850,47 @@ def create_bar_chart(
     ax.spines["left"].set_color("#cbd5e1")
     ax.spines["bottom"].set_color("#cbd5e1")
 
-    # Popisky nad sloupci (zkrácené, aby nepřehušťovaly graf)
-    max_price = max(prices) if prices else 0
-    for rect, p in zip(bars, prices):
-        label = f"{p:,.0f}".replace(",", " ")
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=9))
+    ax.yaxis.set_major_formatter(FuncFormatter(y_formatter))
+    _hide_axis_offset_text(ax)
+    ax.margins(x=0.04)
+
+    ymax = max(y_values) if y_values else 0.0
+    for i, (rect, p_kc) in enumerate(zip(bars, prices)):
+        label = _format_price_chart_label(p_kc)
+        h = rect.get_height()
+        pad = ymax * 0.028 if ymax > 0 else 0.0
+        if i % 2 == 1 and ymax > 0 and h > 0.42 * ymax:
+            pad += ymax * 0.035
         ax.text(
             rect.get_x() + rect.get_width() / 2.0,
-            rect.get_height() + max_price * 0.015,
+            h + pad,
             label,
             ha="center",
             va="bottom",
-            fontsize=13,
+            fontproperties=_chart_font_prop(_CHART_FS_BAR_VALUE),
             color="#1e293b",
         )
 
-    display_name = budget_name[:30] + ("..." if len(budget_name) > 30 else "")
-    ax.set_title(display_name, fontsize=14, fontweight="semibold", pad=6, color="#374151")
-    ax.set_ylabel("Cena (Kč)", fontsize=15, color="#475569")
+    if ymax > 0:
+        ax.set_ylim(0, ymax * 1.08)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=320, bbox_inches="tight", facecolor="white", edgecolor="none")
+    ax.set_ylabel(
+        f"Cena ({y_unit})",
+        fontproperties=_chart_font_prop(_CHART_FS_AXIS),
+        color="#475569",
+    )
+
+    plt.subplots_adjust(left=0.26, right=0.98, top=0.96, bottom=0.32)
+    _ = budget_name
+    plt.savefig(
+        output_path,
+        dpi=_CHART_DPI,
+        bbox_inches="tight",
+        pad_inches=0.14,
+        facecolor="white",
+        edgecolor="none",
+    )
     plt.close()
     return output_path
 
@@ -587,8 +916,8 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
     def get_company_header_lines() -> List[str]:
         # Firemní údaje jsou záměrně natvrdo, bez ENV konfigurace.
         company_name = "Konderla Development, s.r.o."
-        company_id = "07257500"
-        company_tax_id = "CZ07257500"
+        company_id = "07257309"
+        company_tax_id = "CZ07257309"
         company_address = "Příkop 4, 602 00 Brno"
         company_city = ""
         company_email = "tomas@konderla.eu"
@@ -611,7 +940,7 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         lines.append(f"Company ID: {company_id}")
         lines.append(f"VAT number: {company_tax_id}")
 
-        return lines[:4]
+        return lines
 
     def get_company_logo_path() -> Optional[str]:
         # Natvrdo: firemní logo pro pravý horní blok v hlavičce.
@@ -629,8 +958,7 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         return None
 
     def get_items(b):
-        items = b.items if isinstance(b.items, list) else []
-        return items
+        return _get_budget_items_fe(b)
 
     def parse_number_parts(value: Any) -> List[int]:
         raw = str(value or "").strip()
@@ -675,9 +1003,9 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
     chart_priority_labels: List[str] = []
     for b in root_budgets:
         rows_for_chart: List[Tuple[str, float]] = []
-        for item in get_items(b):
+        for item in _chart_item_rows(b, get_items(b)):
             name = (item.get("name") or "").strip()
-            price = float(item.get("price", 0) or 0)
+            price = _parse_price_fe(item.get("price")) or 0.0
             if name and price > 0:
                 rows_for_chart.append((name, price))
         rows_for_chart.sort(key=lambda x: x[1], reverse=True)
@@ -694,11 +1022,11 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         chart_priority_labels.extend([name for name, _ in bar_top])
     label_color_map = _build_label_color_map(chart_priority_labels + all_item_names)
 
-    # Cena položky v daném rozpočtu
+    # Cena položky v daném rozpočtu (stejně jako RoundView: parsePrice || 0)
     def price_for(b, item_name):
         for item in get_items(b):
             if (item.get("name") or "").strip() == item_name:
-                return float(item.get("price", 0))
+                return _parse_price_fe(item.get("price")) or 0.0
         return 0.0
 
     # Jedna srovnávací tabulka: hlavička = Položka + názvy rozpočtů
@@ -714,8 +1042,8 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         leftMargin=15 * mm,
         rightMargin=15 * mm,
         topMargin=21 * mm,
-        # Footer začíná na 30 mm; držíme menší, ale bezpečnou rezervu.
-        bottomMargin=32 * mm,
+        # Rezerva pro patičku (čára + víceřádkový text výš od spodu).
+        bottomMargin=38 * mm,
     )
     story = []
     logo_path = _find_logo_path()
@@ -730,9 +1058,20 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
     )
     subtitle_style = ParagraphStyle(
         "Subtitle", parent=styles["Normal"], fontSize=9, textColor=HexColor("#6b7280"),
-        spaceAfter=16, alignment=TA_LEFT, fontName=_CZECH_FONT,
+        spaceAfter=10, alignment=TA_LEFT, fontName=_CZECH_FONT,
     )
     body_style = ParagraphStyle("BodyCzech", parent=styles["Normal"], fontName=_CZECH_FONT)
+    chart_caption_style = ParagraphStyle(
+        "ChartFileCaption",
+        parent=body_style,
+        fontName=_CZECH_FONT_BOLD,
+        fontSize=10,
+        leading=12,
+        textColor=HexColor("#111827"),
+        alignment=TA_CENTER,
+        spaceAfter=1,
+        spaceBefore=0,
+    )
 
     story.append(Paragraph("VYHODNOCENÍ CENOVÝCH NABÍDEK", title_style))
     if client_name or client_project_name:
@@ -743,54 +1082,99 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
             lines.append(client_project_name)
         story.append(Paragraph("<br/>".join(lines), client_style))
     story.append(Paragraph(f"Vygenerováno: {datetime.now().strftime('%d.%m.%Y %H:%M')}", subtitle_style))
-    story.append(Spacer(1, 8))
 
-    # Grafy připravit hned na začátku.
-    # Každý rozpočet = 1 řádek: koláčový + sloupcový vedle sebe.
-    # Velké grafy: první řádek má zaplnit většinu 1. stránky.
-    chart_width = 132 * mm
-    chart_height = 112 * mm
+    firma_style = ParagraphStyle(
+        "FirmaHeader",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=HexColor("#374151"),
+        spaceAfter=4,
+        spaceBefore=0,
+        alignment=TA_LEFT,
+        fontName=_CZECH_FONT,
+    )
+    firma_warn_style = ParagraphStyle(
+        "FirmaWarn",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=HexColor("#dc2626"),
+        spaceAfter=8,
+        spaceBefore=0,
+        alignment=TA_LEFT,
+        fontName=_CZECH_FONT_BOLD,
+    )
+    story.append(Spacer(1, 4))
+
+    # Grafy: každý rozpočet = řádek koláč + sloupec. Název firmy vždy u příslušných grafů;
+    # KeepTogether zajistí, že se řádek s firmou a grafy na stránce nerozdělí.
+    chart_width = 128 * mm
+    chart_height = 98 * mm
     charts_per_row = 2
-    chart_rows = []
+
+    def build_chart_table(paths_with_names):
+        """Nadpis (název rozpočtu/souboru) v PDF — stejná velikost a řádek u obou grafů."""
+        title_row: List[Any] = []
+        img_row: List[Any] = []
+        for path, cap in paths_with_names:
+            t = (cap or "Rozpočet").strip()
+            title_row.append(Paragraph(html.escape(t).replace("\n", " "), chart_caption_style))
+            try:
+                img_row.append(Image(path, width=chart_width, height=chart_height))
+            except Exception:
+                img_row.append(Spacer(1, 1))
+        while len(title_row) < charts_per_row:
+            title_row.append(Spacer(1, 1))
+            img_row.append(Spacer(chart_width, chart_height))
+        tbl = Table([title_row, img_row], colWidths=[content_width * 0.55, content_width * 0.45])
+        tbl.setStyle(
+            TableStyle(
+                [
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, 0), "TOP"),
+                    ("VALIGN", (0, 1), (-1, 1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                ]
+            )
+        )
+        return tbl
+
+    chart_blocks = 0
     for b in root_budgets:
         items = get_items(b)
         row_charts = []
 
         pie_path = os.path.join(os.path.dirname(output_path), f"chart_{b.id}_pie.png")
-        if create_pie_chart(items, b.name or "Rozpočet", pie_path, color_map=label_color_map):
-            row_charts.append((pie_path, b.name or "Rozpočet"))
+        pie_total = budget_total_round_celek_row(b)
+        chart_title = _budget_chart_title(b)
+        if create_pie_chart(
+            items,
+            b,
+            chart_title,
+            pie_path,
+            color_map=label_color_map,
+            total_display=pie_total,
+        ):
+            row_charts.append((pie_path, chart_title))
 
         bar_path = os.path.join(os.path.dirname(output_path), f"chart_{b.id}_bar.png")
-        if create_bar_chart(items, b.name or "Rozpočet", bar_path, color_map=label_color_map):
-            row_charts.append((bar_path, b.name or "Rozpočet"))
+        if create_bar_chart(items, b, chart_title, bar_path, color_map=label_color_map):
+            row_charts.append((bar_path, chart_title))
 
-        if row_charts:
-            chart_rows.append(row_charts)
+        if not row_charts:
+            continue
 
-    def append_chart_row(paths_with_names):
-        row_cells = []
-        for path, _ in paths_with_names:
-            try:
-                img = Image(path, width=chart_width, height=chart_height)
-                row_cells.append(img)
-            except Exception:
-                row_cells.append(Spacer(1, 1))
-        while len(row_cells) < charts_per_row:
-            row_cells.append(Spacer(chart_width, chart_height))
-        # Donut chart dostane více místa než bar chart.
-        tbl = Table([row_cells], colWidths=[content_width * 0.55, content_width * 0.45])
-        tbl.setStyle(TableStyle([
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(tbl)
+        cn = (getattr(b, "client_name", None) or "").strip()
+        if cn:
+            firma_p = Paragraph(cn, firma_style)
+        else:
+            firma_p = Paragraph("chybí jméno stavební firmy", firma_warn_style)
+        chart_tbl = build_chart_table(row_charts)
+        story.append(KeepTogether([firma_p, Spacer(1, 2), chart_tbl]))
+        story.append(Spacer(1, 4))
+        chart_blocks += 1
 
-    # Všechny rozpočty vykreslit pod sebe (každý rozpočet má svůj řádek grafů).
-    for row_charts in chart_rows:
-        append_chart_row(row_charts)
-        story.append(Spacer(1, 8))
-
-    if chart_rows:
+    if chart_blocks > 0:
         story.append(Spacer(1, 6))
 
     # Tabulka jde na vlastní stránku, aby zůstala dobře čitelná.
@@ -799,11 +1183,13 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
     # Hlavička tabulky: Položka | Rozpočet 1 | Rozpočet 2 | ...
     header_row = [Paragraph("Položka", body_style)]
     for b in root_budgets:
-        name = (b.name or "Rozpočet")[:25] + ("..." if len(b.name or "") > 25 else "")
+        dn = _budget_display_name(b, empty_fallback="Rozpočet")
+        name = _truncate_ellipsis(dn, _TABLE_BUDGET_COL_MAX_LEN)
         header_row.append(Paragraph(name, body_style))
     table_data = [header_row]
 
-    totals = [0.0] * len(root_budgets)
+    # Řádek CELKEM = stejná logika jako „CELKOVÁ CENA“ ve webové tabulce (label / součet parsePrice)
+    totals = [budget_total_round_celek_row(b) for b in root_budgets]
     price_cell_styles = []  # Pro dynamické styly (nejnižší cena = zeleně, nejvyšší = červeně)
     item_column_styles = []  # Sloupec "Položka" barevně laděný podle grafů
 
@@ -816,7 +1202,6 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         prices_in_row = []
         for i, b in enumerate(root_budgets):
             p = price_for(b, item_name)
-            totals[i] += p
             prices_in_row.append((p, i))
             row.append(Paragraph(f"{p:,.0f} Kč".replace(",", " "), body_style))
         table_data.append(row)
@@ -935,64 +1320,21 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
 
     n_rounds = len(rounds)
 
-    def parse_number(value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            raw = value.strip()
-            if not raw:
-                return None
-            # Podpora formátů s čárkou jako desetinným oddělovačem
-            raw = raw.replace(" ", "").replace(",", ".")
-            try:
-                return float(raw)
-            except Exception:
-                return None
-        return None
-
-    def get_budget_items(budget: Any) -> List[Dict[str, Any]]:
-        items = getattr(budget, "items", None)
-        if isinstance(items, list):
-            # items je list dictů
-            return [i for i in items if isinstance(i, dict)]
-        if isinstance(items, dict):
-            # někdy bývá obalené { list: [...] }
-            maybe_list = items.get("list")
-            if isinstance(maybe_list, list):
-                return [i for i in maybe_list if isinstance(i, dict)]
-        return []
-
-    def get_budget_total_price(budget: Any) -> Optional[float]:
-        labels = getattr(budget, "labels", None)
-        if isinstance(labels, dict) and "total_price" in labels:
-            val = parse_number(labels.get("total_price"))
-            if val is not None:
-                return val
-
-        # fallback: součet items.price
-        items = get_budget_items(budget)
-        total = 0.0
-        found_any = False
-        for item in items:
-            price_val = parse_number(item.get("price"))
-            if price_val is None:
-                continue
-            found_any = True
-            total += float(price_val)
-        return total if found_any else None
-
     # company -> prices[] (len = n_rounds), missing value => None
     company_map: Dict[str, List[Optional[float]]] = {}
     for round_idx, r in enumerate(rounds):
         budgets = crud.get_budgets_by_round(db, r.id)
         root_budgets = [b for b in budgets if not b.parent_budget_id]
         for b in root_budgets:
-            company_name = (getattr(b, "name", None) or "Bez názvu").strip() or "Bez názvu"
-            if company_name not in company_map:
-                company_map[company_name] = [None] * n_rounds
-            company_map[company_name][round_idx] = get_budget_total_price(b)
+            base = _budget_display_name(b, empty_fallback="Bez názvu")
+            key = base
+            suffix = 2
+            while key in company_map and company_map[key][round_idx] is not None:
+                key = f"{base} ({suffix})"
+                suffix += 1
+            if key not in company_map:
+                company_map[key] = [None] * n_rounds
+            company_map[key][round_idx] = budget_total_summary_tab(b)
 
     def format_kc(value: float) -> str:
         rounded = int(round(value))
@@ -1045,8 +1387,8 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
     for company_name in company_names_sorted:
         prices = company_map.get(company_name) or [None] * n_rounds
         deltas = compute_deltas(prices)
-
-        row: List[Any] = [Paragraph((company_name[:55] + ("..." if len(company_name) > 55 else "")), body_style)]
+        firma_label = html.escape(company_name[:55] + ("..." if len(company_name) > 55 else ""))
+        row: List[Any] = [Paragraph(firma_label, body_style)]
         for p in prices:
             row.append(Paragraph(format_maybe_kc(p), body_style))
         for d in deltas:
@@ -1062,7 +1404,7 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
         leftMargin=15 * mm,
         rightMargin=15 * mm,
         topMargin=21 * mm,
-        bottomMargin=32 * mm,
+        bottomMargin=38 * mm,
     )
 
     story: List[Any] = []
@@ -1113,8 +1455,8 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
     # Header/footer konzistentní jako u generate_pdf_export
     def get_company_header_lines() -> List[str]:
         company_name = "Konderla Development, s.r.o."
-        company_id = "07257500"
-        company_tax_id = "CZ07257500"
+        company_id = "07257309"
+        company_tax_id = "CZ07257309"
         company_address = "Příkop 4, 602 00 Brno"
 
         lines: List[str] = [company_name]
@@ -1122,7 +1464,9 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
         lines.append(f"DIČ: {company_tax_id}")
         if company_address:
             lines.append(company_address)
-        return lines[:4]
+        lines.append(f"Company ID: {company_id}")
+        lines.append(f"VAT number: {company_tax_id}")
+        return lines
 
     def get_company_logo_path() -> Optional[str]:
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "company-header-logo.png")

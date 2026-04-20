@@ -17,11 +17,15 @@ services:
 
   backend:
     build: ./konderla-dev-be
+    volumes:
+      - ./konderla-dev-be:/app
     ports:
       - "8001:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/procurement
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-${NEXT_PUBLIC_GOOGLE_API_KEY}}
+      # Next.js dev na :3001 když je :3000 obsazený – musí být v CORS
+      - 'CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,https://konderla-dev-fe.vercel.app}'
       - PYTHONUNBUFFERED=1
     depends_on:
       db:
