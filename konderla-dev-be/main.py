@@ -644,7 +644,7 @@ async def export_round_pdf(round_id: UUID, db: Session = Depends(get_db)):
         return FileResponse(
             output_path,
             media_type="application/pdf",
-            filename=f"rozpocty_export_{round_id}.pdf"
+            filename="rozpocty_export.pdf"
         )
     except Exception as e:
         print(f"PDF export error: {e}")
@@ -667,7 +667,7 @@ async def export_project_summary_pdf(project_id: UUID, db: Session = Depends(get
         return FileResponse(
             output_path,
             media_type="application/pdf",
-            filename=f"souhrn_kol_export_{project_id}.pdf",
+            filename="souhrn_kol_export.pdf",
         )
     except Exception as e:
         print(f"Summary PDF export error: {e}")
@@ -675,4 +675,3 @@ async def export_project_summary_pdf(project_id: UUID, db: Session = Depends(get
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate summary PDF: {str(e)}")
-

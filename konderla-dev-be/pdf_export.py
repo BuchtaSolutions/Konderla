@@ -895,8 +895,8 @@ def create_bar_chart(
     return output_path
 
 
-def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
-    """Vygeneruje PDF: jedna srovnávací tabulka (řádky = položky, sloupce = rozpočty) + pod ní jeden graf na rozpočet."""
+def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
+    """Sestaví flowables pro detail jednoho kola. Používá se samostatně i v souhrnném PDF."""
     _register_czech_font()
     budgets = crud.get_budgets_by_round(db, round_id)
     if not budgets:
@@ -1036,15 +1036,6 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
     col_price_w = (content_width - col_item_w) / len(root_budgets) if root_budgets else 40 * mm
     col_widths = [col_item_w] + [col_price_w] * len(root_budgets)
 
-    doc = SimpleDocTemplate(
-        output_path,
-        pagesize=landscape(A4),
-        leftMargin=15 * mm,
-        rightMargin=15 * mm,
-        topMargin=21 * mm,
-        # Rezerva pro patičku (čára + víceřádkový text výš od spodu).
-        bottomMargin=38 * mm,
-    )
     story = []
     logo_path = _find_logo_path()
     styles = getSampleStyleSheet()
@@ -1081,6 +1072,8 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         if client_project_name:
             lines.append(client_project_name)
         story.append(Paragraph("<br/>".join(lines), client_style))
+    if round_obj and round_obj.name:
+        story.append(Paragraph(html.escape(str(round_obj.name)), client_style))
     story.append(Paragraph(f"Vygenerováno: {datetime.now().strftime('%d.%m.%Y %H:%M')}", subtitle_style))
 
     firma_style = ParagraphStyle(
@@ -1139,6 +1132,7 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         )
         return tbl
 
+    chart_story: List[Any] = []
     chart_blocks = 0
     for b in root_budgets:
         items = get_items(b)
@@ -1170,15 +1164,12 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         else:
             firma_p = Paragraph("chybí jméno stavební firmy", firma_warn_style)
         chart_tbl = build_chart_table(row_charts)
-        story.append(KeepTogether([firma_p, Spacer(1, 2), chart_tbl]))
-        story.append(Spacer(1, 4))
+        chart_story.append(KeepTogether([firma_p, Spacer(1, 2), chart_tbl]))
+        chart_story.append(Spacer(1, 4))
         chart_blocks += 1
 
     if chart_blocks > 0:
-        story.append(Spacer(1, 6))
-
-    # Tabulka jde na vlastní stránku, aby zůstala dobře čitelná.
-    story.append(PageBreak())
+        chart_story.append(Spacer(1, 6))
 
     # Hlavička tabulky: Položka | Rozpočet 1 | Rozpočet 2 | ...
     header_row = [Paragraph("Položka", body_style)]
@@ -1250,11 +1241,37 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
     ]
     table.setStyle(TableStyle(base_styles + item_column_styles + price_cell_styles))
     story.append(table)
-    story.append(Spacer(1, 12))
+    if chart_story:
+        story.append(PageBreak())
+        story.extend(chart_story)
+    else:
+        story.append(Spacer(1, 12))
 
     company_lines = get_company_header_lines()
     company_logo_path = get_company_logo_path()
     signature_path = get_signature_path()
+
+    return story, {
+        "logo_path": logo_path,
+        "company_lines": company_lines,
+        "company_logo_path": company_logo_path,
+        "signature_path": signature_path,
+    }
+
+
+def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
+    """Vygeneruje PDF: jedna srovnávací tabulka (řádky = položky, sloupce = rozpočty) + pod ní jeden graf na rozpočet."""
+    story, canvas_context = _build_round_pdf_story(round_id, db, output_path)
+
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=landscape(A4),
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=21 * mm,
+        # Rezerva pro patičku (čára + víceřádkový text výš od spodu).
+        bottomMargin=38 * mm,
+    )
 
     # Vygenerovat PDF s vlastním canvasem (hlavička s logem, patička)
     # ReportLab volá canvasmaker s (filename,) nebo (doc_template), popř. (filename, pagesize, ...)
@@ -1270,13 +1287,13 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
         return PDFCanvas(
             path,
             *args[1:],
-            logo_path=logo_path,
-            company_lines=company_lines,
-            company_logo_path=company_logo_path,
+            logo_path=canvas_context["logo_path"],
+            company_lines=canvas_context["company_lines"],
+            company_logo_path=canvas_context["company_logo_path"],
             owner_name="Tomáš Konderla",
             owner_title="Owner",
             owner_email="tomas@konderla.eu",
-            signature_path=signature_path,
+            signature_path=canvas_context["signature_path"],
             **kwargs,
         )
 
@@ -1298,6 +1315,494 @@ def generate_pdf_export(round_id: UUID, db: Session, output_path: str):
             pass
     
     return output_path
+
+
+def _normalize_item_key(name: str, number: str = "") -> str:
+    raw = f"{number.strip()}::{name.strip().lower()}" if number.strip() else name.strip().lower()
+    return re.sub(r"\s+", " ", raw)
+
+
+def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> List[Any]:
+    """Závěrečná datová část souhrnného reportu: detailní položky ve child rozpočtech."""
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DetailedItemsTitle",
+        parent=styles["Heading1"],
+        fontSize=20,
+        textColor=HexColor("#111827"),
+        spaceAfter=4,
+        spaceBefore=0,
+        alignment=TA_LEFT,
+        fontName=_CZECH_FONT_BOLD,
+        leading=24,
+    )
+    section_style = ParagraphStyle(
+        "DetailedItemsSection",
+        parent=styles["Heading2"],
+        fontSize=13,
+        textColor=HexColor("#1f2937"),
+        spaceAfter=6,
+        spaceBefore=10,
+        alignment=TA_LEFT,
+        fontName=_CZECH_FONT_BOLD,
+        leading=16,
+    )
+    note_style = ParagraphStyle(
+        "DetailedItemsNote",
+        parent=styles["Normal"],
+        fontSize=8.5,
+        textColor=HexColor("#6b7280"),
+        spaceAfter=8,
+        spaceBefore=0,
+        alignment=TA_LEFT,
+        fontName=_CZECH_FONT,
+        leading=11,
+    )
+    cell_style = ParagraphStyle(
+        "DetailedItemsCell",
+        parent=styles["Normal"],
+        fontSize=6.3,
+        textColor=HexColor("#334155"),
+        fontName=_CZECH_FONT,
+        leading=7.4,
+    )
+    header_style = ParagraphStyle(
+        "DetailedItemsHeader",
+        parent=cell_style,
+        fontSize=6.4,
+        textColor=HexColor("#0f172a"),
+        fontName=_CZECH_FONT_BOLD,
+        leading=7.6,
+    )
+    strong_style = ParagraphStyle(
+        "DetailedItemsStrong",
+        parent=cell_style,
+        fontSize=6.3,
+        textColor=HexColor("#111827"),
+        fontName=_CZECH_FONT_BOLD,
+        leading=7.4,
+    )
+
+    def format_kc(value: Optional[float]) -> str:
+        if value is None:
+            return "—"
+        return f"{int(round(value)):,.0f} Kč".replace(",", " ")
+
+    def format_percent(value: Optional[float]) -> str:
+        if value is None:
+            return "—"
+        return f"{value:.1f} %".replace(".", ",")
+
+    def price_for_item(budget: Any, item_key: str) -> Optional[float]:
+        for item in _get_budget_items_fe(budget):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            number = str(item.get("number") or "").strip()
+            if _normalize_item_key(name, number) == item_key:
+                parsed = _parse_price_fe(item.get("price"))
+                return parsed if parsed is not None else 0.0
+        return None
+
+    def child_code(child_budget: Any) -> str:
+        labels = getattr(child_budget, "labels", None)
+        if not isinstance(labels, dict):
+            return ""
+        code = labels.get("code") or labels.get("parent_item_code") or labels.get("section_code")
+        return str(code or "").strip()
+
+    def child_match_key(child_budget: Any) -> str:
+        code = child_code(child_budget)
+        name = str(getattr(child_budget, "name", None) or "").strip()
+        raw = code or name
+        return re.sub(r"\s+", " ", raw.lower()).strip()
+
+    def child_display_name(child_budget: Any) -> str:
+        code = child_code(child_budget)
+        name = str(getattr(child_budget, "name", None) or "").strip()
+        if code and name and code.lower() not in name.lower():
+            return f"{code} - {name}"
+        return name or code or "Objekt"
+
+    def build_savings_summary_table(
+        company_name: str,
+        first_round_name: str,
+        last_round_name: str,
+        rows: List[Dict[str, Any]],
+        *,
+        count_label: str = "Detailních položek se snížením ceny",
+    ) -> Table:
+        comparable_count = len(rows)
+        total_saving = sum(float(row.get("saving") or 0.0) for row in rows)
+        biggest = max(rows, key=lambda row: float(row.get("saving") or 0.0)) if rows else None
+        biggest_label = _truncate_ellipsis(biggest["name"], 60) if biggest else "—"
+        biggest_value = format_kc(biggest["saving"]) if biggest else "—"
+
+        data = [
+            [
+                Paragraph("Firma", header_style),
+                Paragraph("Porovnané období", header_style),
+                Paragraph(count_label, header_style),
+                Paragraph("Součet položkových úspor", header_style),
+                Paragraph("Největší jednotlivá úspora", header_style),
+            ],
+            [
+                Paragraph(html.escape(_truncate_ellipsis(company_name, 34)), strong_style),
+                Paragraph(f"{html.escape(str(first_round_name))} → {html.escape(str(last_round_name))}", strong_style),
+                Paragraph(str(comparable_count), strong_style),
+                Paragraph(format_kc(total_saving), strong_style),
+                Paragraph(f"{html.escape(biggest_label)}<br/>{biggest_value}", strong_style),
+            ],
+        ]
+        table = Table(data, colWidths=[44 * mm, 42 * mm, 42 * mm, 50 * mm, 74 * mm])
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), HexColor("#e2e8f0")),
+                    ("BACKGROUND", (0, 1), (-1, 1), HexColor("#f8fafc")),
+                    ("TEXTCOLOR", (0, 0), (-1, -1), HexColor("#111827")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("BOX", (0, 0), (-1, -1), 0.6, HexColor("#cbd5e1")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.4, HexColor("#e2e8f0")),
+                ]
+            )
+        )
+        return table
+
+    def build_root_table(rows: List[Dict[str, Any]], *, compact: bool) -> Table:
+        header = [
+            Paragraph("Č.", header_style),
+            Paragraph("Položka", header_style),
+            Paragraph("Původní kolo", header_style),
+            Paragraph("Původní cena", header_style),
+            Paragraph("Poslední kolo", header_style),
+            Paragraph("Poslední cena", header_style),
+            Paragraph("Úspora", header_style),
+            Paragraph("Úspora %", header_style),
+        ]
+
+        data: List[List[Any]] = [header]
+        for row in rows:
+            data.append(
+                [
+                    Paragraph(html.escape(_truncate_ellipsis(row["number"], 12)), cell_style),
+                    Paragraph(html.escape(_truncate_ellipsis(row["name"], 92 if compact else 110)), cell_style),
+                    Paragraph(html.escape(_truncate_ellipsis(row["first_round"], 22)), cell_style),
+                    Paragraph(format_kc(row["first_price"]), strong_style),
+                    Paragraph(html.escape(_truncate_ellipsis(row["last_round"], 22)), cell_style),
+                    Paragraph(format_kc(row["last_price"]), strong_style),
+                    Paragraph(format_kc(row["saving"]), strong_style),
+                    Paragraph(format_percent(row["saving_pct"]), strong_style),
+                ]
+            )
+
+        table = Table(
+            data,
+            colWidths=[12 * mm, 84 * mm, 24 * mm, 24 * mm, 24 * mm, 24 * mm, 24 * mm, 18 * mm],
+            repeatRows=1,
+        )
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), HexColor("#e2e8f0")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#0f172a")),
+                    ("FONTNAME", (0, 0), (-1, 0), _CZECH_FONT_BOLD),
+                    ("ALIGN", (0, 0), (2, -1), "LEFT"),
+                    ("ALIGN", (3, 0), (3, -1), "RIGHT"),
+                    ("ALIGN", (5, 0), (-1, -1), "RIGHT"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [HexColor("#ffffff"), HexColor("#fcfdff")]),
+                    ("BACKGROUND", (6, 1), (6, -1), HexColor("#dcfce7")),
+                    ("TEXTCOLOR", (6, 1), (6, -1), HexColor("#166534")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3 if compact else 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3 if compact else 2),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                    ("LINEBELOW", (0, 0), (-1, 0), 1, HexColor("#cbd5e1")),
+                ]
+            )
+        )
+        return table
+
+    def build_table(rows: List[Dict[str, Any]], *, compact: bool) -> Table:
+        header = [
+            Paragraph("Objekt", header_style),
+            Paragraph("Č.", header_style),
+            Paragraph("Položka", header_style),
+            Paragraph("Původní cena", header_style),
+            Paragraph("Poslední cena", header_style),
+            Paragraph("Úspora", header_style),
+            Paragraph("Úspora %", header_style),
+        ]
+
+        data: List[List[Any]] = [header]
+        for row in rows:
+            row_cells: List[Any] = [
+                Paragraph(html.escape(_truncate_ellipsis(row.get("object") or "", 38)), cell_style),
+                Paragraph(html.escape(_truncate_ellipsis(row["number"], 12)), cell_style),
+                Paragraph(html.escape(_truncate_ellipsis(row["name"], 78 if compact else 94)), cell_style),
+                Paragraph(format_kc(row["first_price"]), strong_style),
+                Paragraph(format_kc(row["last_price"]), strong_style),
+                Paragraph(format_kc(row["saving"]), strong_style),
+                Paragraph(format_percent(row["saving_pct"]), strong_style),
+            ]
+            data.append(row_cells)
+
+        col_widths = [
+            38 * mm,
+            12 * mm,
+            72 * mm,
+            28 * mm,
+            28 * mm,
+            26 * mm,
+            18 * mm,
+        ]
+
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+        base_styles = [
+            ("BACKGROUND", (0, 0), (-1, 0), HexColor("#e2e8f0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#0f172a")),
+            ("FONTNAME", (0, 0), (-1, 0), _CZECH_FONT_BOLD),
+            ("ALIGN", (0, 0), (2, -1), "LEFT"),
+            ("ALIGN", (3, 0), (3, -1), "RIGHT"),
+            ("ALIGN", (4, 0), (-1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [HexColor("#ffffff"), HexColor("#fcfdff")]),
+            ("BACKGROUND", (5, 1), (5, -1), HexColor("#dcfce7")),
+            ("TEXTCOLOR", (5, 1), (5, -1), HexColor("#166534")),
+            ("TOPPADDING", (0, 0), (-1, -1), 3 if compact else 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3 if compact else 2),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBELOW", (0, 0), (-1, 0), 1, HexColor("#cbd5e1")),
+        ]
+        table.setStyle(TableStyle(base_styles))
+        return table
+
+    def build_root_saving_rows(
+        first_round_name: str,
+        first_budget: Any,
+        last_round_name: str,
+        last_budget: Any,
+    ) -> List[Dict[str, Any]]:
+        item_meta: Dict[str, Dict[str, str]] = {}
+        ordered_keys: List[str] = []
+        for item in _get_budget_items_fe(first_budget):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            number = str(item.get("number") or "").strip()
+            key = _normalize_item_key(name, number)
+            item_meta[key] = {"name": name, "number": number}
+            ordered_keys.append(key)
+
+        rows: List[Dict[str, Any]] = []
+        for key in ordered_keys:
+            first_price = price_for_item(first_budget, key)
+            last_price = price_for_item(last_budget, key)
+            if first_price is None or last_price is None:
+                continue
+            saving = first_price - last_price
+            if saving <= 0:
+                continue
+            saving_pct = (saving / first_price * 100.0) if first_price and first_price > 0 else None
+            rows.append(
+                {
+                    "object": "Souhrn objektů",
+                    "name": item_meta[key]["name"],
+                    "number": item_meta[key]["number"],
+                    "first_round": first_round_name,
+                    "first_price": first_price,
+                    "last_round": last_round_name,
+                    "last_price": last_price,
+                    "saving": saving,
+                    "saving_pct": saving_pct,
+                }
+            )
+        return rows
+
+    def build_child_saving_rows(
+        first_round_id: Any,
+        first_round_name: str,
+        first_budget: Any,
+        last_round_id: Any,
+        last_round_name: str,
+        last_budget: Any,
+        budgets_by_round: Dict[Any, List[Any]],
+    ) -> List[Dict[str, Any]]:
+        first_children = [
+            b for b in budgets_by_round.get(first_round_id, [])
+            if getattr(b, "parent_budget_id", None) == getattr(first_budget, "id", None)
+        ]
+        last_children = [
+            b for b in budgets_by_round.get(last_round_id, [])
+            if getattr(b, "parent_budget_id", None) == getattr(last_budget, "id", None)
+        ]
+        last_children_by_key = {
+            child_match_key(child): child
+            for child in last_children
+            if child_match_key(child)
+        }
+
+        rows: List[Dict[str, Any]] = []
+        seen_row_keys = set()
+        for first_child in first_children:
+            key = child_match_key(first_child)
+            if not key:
+                continue
+            last_child = last_children_by_key.get(key)
+            if not last_child:
+                continue
+
+            object_name = child_display_name(first_child)
+            item_meta: Dict[str, Dict[str, str]] = {}
+            ordered_keys: List[str] = []
+            for item in _get_budget_items_fe(first_child):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                number = str(item.get("number") or "").strip()
+                item_key = _normalize_item_key(name, number)
+                if not item_key:
+                    continue
+                item_meta[item_key] = {"name": name, "number": number}
+                ordered_keys.append(item_key)
+
+            for item_key in ordered_keys:
+                first_price = price_for_item(first_child, item_key)
+                last_price = price_for_item(last_child, item_key)
+                if first_price is None or last_price is None:
+                    continue
+                saving = first_price - last_price
+                if saving <= 0:
+                    continue
+                dedupe_key = (key, item_key)
+                if dedupe_key in seen_row_keys:
+                    continue
+                seen_row_keys.add(dedupe_key)
+                saving_pct = (saving / first_price * 100.0) if first_price and first_price > 0 else None
+                rows.append(
+                    {
+                        "object": object_name,
+                        "name": item_meta[item_key]["name"],
+                        "number": item_meta[item_key]["number"],
+                        "first_round": first_round_name,
+                        "first_price": first_price,
+                        "last_round": last_round_name,
+                        "last_price": last_price,
+                        "saving": saving,
+                        "saving_pct": saving_pct,
+                    }
+                )
+        return rows
+
+    story: List[Any] = [Paragraph("Položkové úspory mezi koly", title_style)]
+
+    company_history: Dict[str, List[Tuple[int, str, Any]]] = {}
+    budgets_by_round: Dict[Any, List[Any]] = {}
+    for round_idx, r in enumerate(rounds):
+        budgets = crud.get_budgets_by_round(db, r.id)
+        budgets_by_round[r.id] = budgets
+        root_budgets = [b for b in budgets if not b.parent_budget_id]
+        for b in root_budgets:
+            base = _budget_display_name(b)
+            key = base
+            suffix = 2
+            while any(entry[0] == round_idx for entry in company_history.get(key, [])):
+                key = f"{base} ({suffix})"
+                suffix += 1
+            company_history.setdefault(key, []).append((round_idx, str(r.name), b))
+
+    for company_name in sorted(company_history.keys(), key=lambda value: value.lower()):
+        history = sorted(company_history[company_name], key=lambda entry: entry[0])
+        if len(history) < 2:
+            continue
+
+        first_round_idx, first_round_name, first_budget = history[0]
+        last_round_idx, last_round_name, last_budget = history[-1]
+        first_round_id = rounds[first_round_idx].id
+        last_round_id = rounds[last_round_idx].id
+
+        root_rows = build_root_saving_rows(first_round_name, first_budget, last_round_name, last_budget)
+        child_rows = build_child_saving_rows(
+            first_round_id,
+            first_round_name,
+            first_budget,
+            last_round_id,
+            last_round_name,
+            last_budget,
+            budgets_by_round,
+        )
+
+        if not root_rows and not child_rows:
+            continue
+
+        if root_rows:
+            root_rows_by_saving = sorted(root_rows, key=lambda x: (x["saving"] or 0.0), reverse=True)
+            root_top_rows = root_rows_by_saving[:30]
+            story.append(Paragraph(f"{html.escape(company_name)} - souhrnné úspory za objekty", section_style))
+            story.append(
+                build_savings_summary_table(
+                    company_name,
+                    first_round_name,
+                    last_round_name,
+                    root_rows,
+                    count_label="Objektů se snížením ceny",
+                )
+            )
+            story.append(Spacer(1, 8))
+            story.append(
+                Paragraph(
+                    "TOP objekty podle snížení ceny mezi první a poslední nabídkou firmy",
+                    note_style,
+                )
+            )
+            story.append(build_root_table(root_top_rows, compact=True))
+            story.append(PageBreak())
+            if len(root_rows_by_saving) > len(root_top_rows):
+                story.append(Paragraph(f"Kompletní souhrnné úspory - {html.escape(company_name)}", section_style))
+                story.append(build_root_table(root_rows_by_saving, compact=False))
+                story.append(PageBreak())
+
+        if child_rows:
+            child_rows_by_saving = sorted(child_rows, key=lambda x: (x["saving"] or 0.0), reverse=True)
+            child_top_rows = child_rows_by_saving[:30]
+            story.append(Paragraph(f"{html.escape(company_name)} - detailní úspory v položkách", section_style))
+            story.append(
+                build_savings_summary_table(
+                    company_name,
+                    first_round_name,
+                    last_round_name,
+                    child_rows,
+                )
+            )
+            story.append(Spacer(1, 8))
+            story.append(
+                Paragraph(
+                    "TOP detailní položky podle snížení ceny mezi první a poslední nabídkou firmy",
+                    note_style,
+                )
+            )
+            story.append(build_table(child_top_rows, compact=True))
+            story.append(PageBreak())
+            if len(child_rows_by_saving) > len(child_top_rows):
+                story.append(Paragraph(f"Kompletní detailní položkové úspory - {html.escape(company_name)}", section_style))
+                story.append(build_table(child_rows_by_saving, compact=False))
+                story.append(PageBreak())
+
+    if len(story) > 1 and isinstance(story[-1], PageBreak):
+        story.pop()
+    return story if len(story) > 1 else []
 
 
 def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str) -> str:
@@ -1345,21 +1850,17 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
         return "—" if value is None else format_kc(value)
 
     def format_delta(value: Optional[float]) -> str:
-        return "—" if value is None else format_kc(abs(value))
+        return "N/A" if value is None else format_kc(abs(value))
 
     def compute_deltas(prices: List[Optional[float]]) -> List[Optional[float]]:
         deltas: List[Optional[float]] = []
         for idx in range(n_rounds - 1):
             prev = prices[idx]
             curr = prices[idx + 1]
-            if curr is None and prev is None:
+            if curr is None or prev is None:
                 deltas.append(None)
-            elif curr is not None and prev is None:
-                deltas.append(curr)
-            elif curr is None and prev is not None:
-                deltas.append(-prev)
             else:
-                deltas.append((curr or 0.0) - (prev or 0.0))
+                deltas.append(curr - prev)
         return deltas
 
     company_names_sorted = sorted(company_map.keys(), key=lambda x: x.lower())
@@ -1393,7 +1894,7 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
             row.append(Paragraph(format_maybe_kc(p), body_style))
         for d in deltas:
             if d is None:
-                row.append(Paragraph("—", body_style))
+                row.append(Paragraph(format_delta(d), body_style))
             else:
                 row.append(Paragraph(format_delta(d), delta_style))
         table_data.append(row)
@@ -1451,6 +1952,20 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
     ]
     table.setStyle(TableStyle(base_styles))
     story.append(table)
+
+    # Za souhrnnou tabulku přidej kompletní detail každého kola do stejného PDF.
+    for r in rounds:
+        try:
+            round_story, _ = _build_round_pdf_story(r.id, db, output_path)
+        except ValueError:
+            continue
+        story.append(PageBreak())
+        story.extend(round_story)
+
+    detailed_items_story = _build_detailed_items_comparison_story(rounds, db)
+    if detailed_items_story:
+        story.append(PageBreak())
+        story.extend(detailed_items_story)
 
     # Header/footer konzistentní jako u generate_pdf_export
     def get_company_header_lines() -> List[str]:
@@ -1516,5 +2031,14 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
 
         logging.getLogger(__name__).warning("Summary PDF custom canvas failed: %s", e, exc_info=True)
         doc.build(story)
+
+    # Smazat dočasné grafy vytvořené pro vložené detaily kol.
+    import glob
+    chart_files = glob.glob(os.path.join(os.path.dirname(output_path), "chart_*.png"))
+    for f in chart_files:
+        try:
+            os.remove(f)
+        except:
+            pass
 
     return output_path
