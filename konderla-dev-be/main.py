@@ -362,12 +362,16 @@ async def create_budget(
     return crud.create_budget(db=db, budget=budget_data)
 
 import json
+import threading
 from fastapi import Response
 from typing import List, Optional
 
+budgets_read_lock = threading.Lock()
+
 @app.get("/rounds/{round_id}/budgets/")
 def read_budgets(round_id: UUID, db: Session = Depends(get_db)):
-    budgets = crud.get_budgets_by_round(db, round_id=round_id)
+    with budgets_read_lock:
+        budgets = crud.get_budgets_by_round(db, round_id=round_id)
     print(f"[API] Returning {len(budgets)} budgets for round_id={round_id}")
     root_count = sum(1 for b in budgets if not b.parent_budget_id)
     child_count = sum(1 for b in budgets if b.parent_budget_id)
@@ -412,9 +416,9 @@ def read_budgets(round_id: UUID, db: Session = Depends(get_db)):
 
     # Manuálně vytvoříme JSON, abychom obešli Pydantic/FastAPI jsonable_encoder,
     # který na velkých projektech se stovkami child_budgetů přetěžuje RAM.
-    dicts = []
+    parts = []
     for b in budgets:
-        dicts.append({
+        d = {
             "id": str(b.id),
             "round_id": str(b.round_id),
             "project_id": str(b.project_id),
@@ -428,9 +432,17 @@ def read_budgets(round_id: UUID, db: Session = Depends(get_db)):
             "labels": b.labels,
             "items": b.items,
             "dynamic_fields": b.dynamic_fields,
-        })
+        }
+        parts.append(json.dumps(d))
+        db.expunge(b)
     
-    return Response(content=json.dumps(dicts), media_type="application/json")
+    db.expunge_all()
+    json_str = "[" + ",".join(parts) + "]"
+    del parts
+    del budgets
+    import gc
+    gc.collect()
+    return Response(content=json_str, media_type="application/json")
 
 @app.delete("/budgets/{budget_id}")
 def delete_budget(budget_id: UUID, db: Session = Depends(get_db)):
@@ -455,7 +467,7 @@ def read_budget_notes(budget_id: UUID, db: Session = Depends(get_db)):
     return crud.get_budget_notes(db, budget_id)
 
 # Promote
-@app.post("/promote/", response_model=schemas.Round)
+@app.post("/promote/", response_model=schemas.RoundWithoutBudgets)
 def promote_round(promote_req: schemas.PromoteRequest, db: Session = Depends(get_db)):
     new_round = crud.promote_to_next_round(db, promote_req)
     if new_round is None:

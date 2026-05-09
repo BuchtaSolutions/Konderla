@@ -1244,6 +1244,12 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
     table_data.append(total_row)
 
     table = LongTable(table_data, colWidths=col_widths, repeatRows=1)
+    
+    # Ochrana proti OOM z ReportLab TableStyle při tisících položkách
+    if len(all_item_names) > 500:
+        item_column_styles = []
+        price_cell_styles = []
+        
     base_styles = [
         ("BACKGROUND", (0, 0), (-1, 0), HexColor("#e2e8f0")),
         ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#0f172a")),
