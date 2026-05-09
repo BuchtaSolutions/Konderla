@@ -399,14 +399,23 @@ def _parse_price_fe(value: Any) -> Optional[float]:
 
 def _get_budget_items_fe(budget: Any) -> List[Dict[str, Any]]:
     """Stejné jako `getBudgetItemsSafe` na stránce projektu (pole nebo `items.list`)."""
+    if hasattr(budget, "_cached_fe_items"):
+        return budget._cached_fe_items
+    
     items = getattr(budget, "items", None)
+    result = []
     if isinstance(items, list):
-        return [i for i in items if isinstance(i, dict)]
-    if isinstance(items, dict):
+        result = [i for i in items if isinstance(i, dict)]
+    elif isinstance(items, dict):
         maybe_list = items.get("list")
         if isinstance(maybe_list, list):
-            return [i for i in maybe_list if isinstance(i, dict)]
-    return []
+            result = [i for i in maybe_list if isinstance(i, dict)]
+    
+    try:
+        budget._cached_fe_items = result
+    except Exception:
+        pass  # In case budget doesn't allow setting attributes
+    return result
 
 
 def _truncate_ellipsis(text: str, max_len: int) -> str:
@@ -779,7 +788,10 @@ def create_pie_chart(
     fig.subplots_adjust(bottom=0.22, top=0.96)
     _ = budget_name
     plt.savefig(output_path, dpi=_CHART_DPI, facecolor="white", edgecolor="none")
-    plt.close()
+    fig.clf()
+    plt.close(fig)
+    import gc
+    gc.collect()
     
     return output_path
 
@@ -891,7 +903,10 @@ def create_bar_chart(
         facecolor="white",
         edgecolor="none",
     )
-    plt.close()
+    fig.clf()
+    plt.close(fig)
+    import gc
+    gc.collect()
     return output_path
 
 
@@ -957,8 +972,13 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
                 return candidate
         return None
 
+    # Caching položek pro zrychlení O(N) na O(1)
+    b_items_cache = {}
     def get_items(b):
-        return _get_budget_items_fe(b)
+        b_id = getattr(b, "id", id(b))
+        if b_id not in b_items_cache:
+            b_items_cache[b_id] = _get_budget_items_fe(b)
+        return b_items_cache[b_id]
 
     def parse_number_parts(value: Any) -> List[int]:
         raw = str(value or "").strip()
@@ -966,12 +986,16 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
             return []
         return [int(x) for x in re.findall(r"\d+", raw)]
 
+    # Předpočítání čísel položek (pro get_item_number_from_budgets)
+    item_number_map: Dict[str, str] = {}
+    for budget in root_budgets or []:
+        for item in get_items(budget):
+            name = (item.get("name") or "").strip()
+            if name and name not in item_number_map:
+                item_number_map[name] = str(item.get("number") or "")
+
     def get_item_number_from_budgets(item_name: str, budgets_pool: List[Any]) -> str:
-        for budget in budgets_pool or []:
-            for item in get_items(budget):
-                if (item.get("name") or "").strip() == item_name:
-                    return str(item.get("number") or "")
-        return ""
+        return item_number_map.get(item_name, "")
 
     # Všechna jedinečná jména položek napříč rozpočty (strukturální pořadí jako v UI)
     all_item_names = set()
@@ -1022,12 +1046,21 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
         chart_priority_labels.extend([name for name, _ in bar_top])
     label_color_map = _build_label_color_map(chart_priority_labels + all_item_names)
 
+    # Předpočítané ceny pro O(1) vyhledávání
+    budget_prices_map: Dict[Any, Dict[str, float]] = {}
+    for b in root_budgets:
+        b_id = getattr(b, "id", id(b))
+        b_map = {}
+        for item in get_items(b):
+            name = (item.get("name") or "").strip()
+            if name and name not in b_map:
+                b_map[name] = _parse_price_fe(item.get("price")) or 0.0
+        budget_prices_map[b_id] = b_map
+
     # Cena položky v daném rozpočtu (stejně jako RoundView: parsePrice || 0)
     def price_for(b, item_name):
-        for item in get_items(b):
-            if (item.get("name") or "").strip() == item_name:
-                return _parse_price_fe(item.get("price")) or 0.0
-        return 0.0
+        b_id = getattr(b, "id", id(b))
+        return budget_prices_map.get(b_id, {}).get(item_name, 0.0)
 
     # Jedna srovnávací tabulka: hlavička = Položka + názvy rozpočtů
     n_cols = 1 + len(root_budgets)
@@ -1393,7 +1426,14 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
             return "—"
         return f"{value:.1f} %".replace(".", ",")
 
-    def price_for_item(budget: Any, item_key: str) -> Optional[float]:
+    _budget_items_cache: Dict[Any, Dict[str, Optional[float]]] = {}
+
+    def get_budget_prices_dict(budget: Any) -> Dict[str, Optional[float]]:
+        b_id = getattr(budget, "id", id(budget))
+        if b_id in _budget_items_cache:
+            return _budget_items_cache[b_id]
+        
+        prices_dict = {}
         for item in _get_budget_items_fe(budget):
             if not isinstance(item, dict):
                 continue
@@ -1401,10 +1441,17 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
             if not name:
                 continue
             number = str(item.get("number") or "").strip()
-            if _normalize_item_key(name, number) == item_key:
+            key = _normalize_item_key(name, number)
+            if key not in prices_dict:
                 parsed = _parse_price_fe(item.get("price"))
-                return parsed if parsed is not None else 0.0
-        return None
+                prices_dict[key] = parsed if parsed is not None else 0.0
+        
+        _budget_items_cache[b_id] = prices_dict
+        return prices_dict
+
+    def price_for_item(budget: Any, item_key: str) -> Optional[float]:
+        prices_dict = get_budget_prices_dict(budget)
+        return prices_dict.get(item_key, None)
 
     def child_code(child_budget: Any) -> str:
         labels = getattr(child_budget, "labels", None)
