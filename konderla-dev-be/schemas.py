@@ -76,6 +76,13 @@ class RoundBase(BaseModel):
 class RoundCreate(RoundBase):
     project_id: UUID
 
+class RoundWithoutBudgets(RoundBase):
+    id: UUID
+    project_id: UUID
+
+    class Config:
+        orm_mode = True
+
 class Round(RoundBase):
     id: UUID
     project_id: UUID
@@ -102,7 +109,7 @@ class ProjectUpdate(BaseModel):
 
 class Project(ProjectBase):
     id: UUID
-    rounds: List[Round] = []
+    rounds: List[RoundWithoutBudgets] = []
 
     class Config:
         orm_mode = True

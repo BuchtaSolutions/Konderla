@@ -306,15 +306,15 @@ def delete_project(project_id: UUID, db: Session = Depends(get_db)):
     return db_project
 
 # Rounds
-@app.post("/rounds/", response_model=schemas.Round)
+@app.post("/rounds/", response_model=schemas.RoundWithoutBudgets)
 def create_round(round: schemas.RoundCreate, db: Session = Depends(get_db)):
     return crud.create_round(db=db, round=round)
 
-@app.get("/projects/{project_id}/rounds/", response_model=List[schemas.Round])
+@app.get("/projects/{project_id}/rounds/", response_model=List[schemas.RoundWithoutBudgets])
 def read_rounds(project_id: UUID, db: Session = Depends(get_db)):
     return crud.get_rounds_by_project(db, project_id=project_id)
 
-@app.delete("/rounds/{round_id}", response_model=schemas.Round)
+@app.delete("/rounds/{round_id}", response_model=schemas.RoundWithoutBudgets)
 def delete_round(round_id: UUID, db: Session = Depends(get_db)):
     db_round = crud.delete_round(db=db, round_id=round_id)
     if db_round is None:
@@ -361,7 +361,11 @@ async def create_budget(
     )
     return crud.create_budget(db=db, budget=budget_data)
 
-@app.get("/rounds/{round_id}/budgets/", response_model=List[schemas.Budget])
+import json
+from fastapi import Response
+from typing import List, Optional
+
+@app.get("/rounds/{round_id}/budgets/")
 def read_budgets(round_id: UUID, db: Session = Depends(get_db)):
     budgets = crud.get_budgets_by_round(db, round_id=round_id)
     print(f"[API] Returning {len(budgets)} budgets for round_id={round_id}")
@@ -405,7 +409,28 @@ def read_budgets(round_id: UUID, db: Session = Depends(get_db)):
                         print(f"[API]   Enriched item '{code}' ({name[:30]}): {old_price} -> {total}")
         if enriched_count > 0:
             print(f"[API] Root budget id={b.id} name='{b.name}': enriched {enriched_count}/{len(b.items)} parent items from {len(children)} children")
-    return budgets
+
+    # Manuálně vytvoříme JSON, abychom obešli Pydantic/FastAPI jsonable_encoder,
+    # který na velkých projektech se stovkami child_budgetů přetěžuje RAM.
+    dicts = []
+    for b in budgets:
+        dicts.append({
+            "id": str(b.id),
+            "round_id": str(b.round_id),
+            "project_id": str(b.project_id),
+            "parent_budget_id": str(b.parent_budget_id) if b.parent_budget_id else None,
+            "name": b.name,
+            "notes": b.notes,
+            "score": b.score,
+            "file_path": b.file_path,
+            "client_name": b.client_name,
+            "client_project_name": b.client_project_name,
+            "labels": b.labels,
+            "items": b.items,
+            "dynamic_fields": b.dynamic_fields,
+        })
+    
+    return Response(content=json.dumps(dicts), media_type="application/json")
 
 @app.delete("/budgets/{budget_id}")
 def delete_budget(budget_id: UUID, db: Session = Depends(get_db)):

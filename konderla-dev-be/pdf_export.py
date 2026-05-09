@@ -1767,7 +1767,8 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
     
     # První průchod: načteme jen root rozpočty do company_history, abychom nenahrávali do paměti vše
     for round_idx, r in enumerate(rounds):
-        root_budgets = [b for b in crud.get_budgets_by_round(db, r.id) if not b.parent_budget_id]
+        all_budgets = crud.get_budgets_by_round(db, r.id)
+        root_budgets = [b for b in all_budgets if not b.parent_budget_id]
         
         # Tyhle potřebujeme načíst (ale vyhneme se cachování child budgets v tomto kroku)
         for b in root_budgets:
@@ -1778,7 +1779,13 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
                 key = f"{base} ({suffix})"
                 suffix += 1
             company_history.setdefault(key, []).append((round_idx, str(r.name), b.id))
+        
+        for b in all_budgets:
             db.expunge(b)
+        del all_budgets
+        del root_budgets
+        import gc
+        gc.collect()
 
     for company_name in sorted(company_history.keys(), key=lambda value: value.lower()):
         history = sorted(company_history[company_name], key=lambda entry: entry[0])
@@ -2143,5 +2150,11 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
             os.remove(f)
         except:
             pass
+            
+    # Pročistit a zbavit se struktury story, která v paměti drží statisíce objektů
+    story.clear()
+    del story
+    import gc
+    gc.collect()
 
     return output_path
