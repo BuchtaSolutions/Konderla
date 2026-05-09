@@ -1764,10 +1764,12 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
 
     company_history: Dict[str, List[Tuple[int, str, Any]]] = {}
     budgets_by_round: Dict[Any, List[Any]] = {}
+    
+    # První průchod: načteme jen root rozpočty do company_history, abychom nenahrávali do paměti vše
     for round_idx, r in enumerate(rounds):
-        budgets = crud.get_budgets_by_round(db, r.id)
-        budgets_by_round[r.id] = budgets
-        root_budgets = [b for b in budgets if not b.parent_budget_id]
+        root_budgets = [b for b in crud.get_budgets_by_round(db, r.id) if not b.parent_budget_id]
+        
+        # Tyhle potřebujeme načíst (ale vyhneme se cachování child budgets v tomto kroku)
         for b in root_budgets:
             base = _budget_display_name(b)
             key = base
@@ -1775,17 +1777,30 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
             while any(entry[0] == round_idx for entry in company_history.get(key, [])):
                 key = f"{base} ({suffix})"
                 suffix += 1
-            company_history.setdefault(key, []).append((round_idx, str(r.name), b))
+            company_history.setdefault(key, []).append((round_idx, str(r.name), b.id))
+            db.expunge(b)
 
     for company_name in sorted(company_history.keys(), key=lambda value: value.lower()):
         history = sorted(company_history[company_name], key=lambda entry: entry[0])
         if len(history) < 2:
             continue
 
-        first_round_idx, first_round_name, first_budget = history[0]
-        last_round_idx, last_round_name, last_budget = history[-1]
+        first_round_idx, first_round_name, first_budget_id = history[0]
+        last_round_idx, last_round_name, last_budget_id = history[-1]
         first_round_id = rounds[first_round_idx].id
         last_round_id = rounds[last_round_idx].id
+
+        # Nyní pro tyto 2 relevantní kola dotáhneme celý strom
+        if first_round_id not in budgets_by_round:
+            budgets_by_round[first_round_id] = crud.get_budgets_by_round(db, first_round_id)
+        if last_round_id not in budgets_by_round:
+            budgets_by_round[last_round_id] = crud.get_budgets_by_round(db, last_round_id)
+
+        first_budget = next((b for b in budgets_by_round[first_round_id] if b.id == first_budget_id), None)
+        last_budget = next((b for b in budgets_by_round[last_round_id] if b.id == last_budget_id), None)
+
+        if not first_budget or not last_budget:
+            continue
 
         root_rows = build_root_saving_rows(first_round_name, first_budget, last_round_name, last_budget)
         child_rows = build_child_saving_rows(
@@ -1797,6 +1812,19 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
             last_budget,
             budgets_by_round,
         )
+
+        # Uvolníme rozpočty z paměti pro tuto iteraci firmy a z cache
+        for b in budgets_by_round.get(first_round_id, []):
+            db.expunge(b)
+        for b in budgets_by_round.get(last_round_id, []):
+            db.expunge(b)
+        budgets_by_round.clear()
+        import gc
+        gc.collect()
+
+        # Postupné čištění uvolněných kol, která už nepotřebujeme
+        # Opatrně: pro další firmu by se ještě mohly hodit, 
+        # ale my to teď nabereme do cache tak, abychom zamezili pádu v jednom kroku.
 
         if not root_rows and not child_rows:
             continue
@@ -1861,6 +1889,10 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
     for b_list in budgets_by_round.values():
         for b in b_list:
             db.expunge(b)
+            
+    budgets_by_round.clear()
+    import gc
+    gc.collect()
 
     return story if len(story) > 1 else []
 
@@ -1904,6 +1936,11 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
         # Uvolnit paměť (SQLAlchemy drží JSON items v paměti pro celý request)
         for b in budgets:
             db.expunge(b)
+        
+        del budgets
+        del root_budgets
+        import gc
+        gc.collect()
 
     def format_kc(value: float) -> str:
         rounded = int(round(value))
