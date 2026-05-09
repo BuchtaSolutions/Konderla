@@ -1,7 +1,7 @@
 from reportlab.lib import colors, utils as rl_utils
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Table, LongTable, TableStyle, Paragraph, Spacer, PageBreak, Image, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.pdfgen import canvas
@@ -399,9 +399,6 @@ def _parse_price_fe(value: Any) -> Optional[float]:
 
 def _get_budget_items_fe(budget: Any) -> List[Dict[str, Any]]:
     """Stejné jako `getBudgetItemsSafe` na stránce projektu (pole nebo `items.list`)."""
-    if hasattr(budget, "_cached_fe_items"):
-        return budget._cached_fe_items
-    
     items = getattr(budget, "items", None)
     result = []
     if isinstance(items, list):
@@ -411,10 +408,6 @@ def _get_budget_items_fe(budget: Any) -> List[Dict[str, Any]]:
         if isinstance(maybe_list, list):
             result = [i for i in maybe_list if isinstance(i, dict)]
     
-    try:
-        budget._cached_fe_items = result
-    except Exception:
-        pass  # In case budget doesn't allow setting attributes
     return result
 
 
@@ -789,7 +782,7 @@ def create_pie_chart(
     _ = budget_name
     plt.savefig(output_path, dpi=_CHART_DPI, facecolor="white", edgecolor="none")
     fig.clf()
-    plt.close(fig)
+    plt.close('all')
     import gc
     gc.collect()
     
@@ -904,7 +897,7 @@ def create_bar_chart(
         edgecolor="none",
     )
     fig.clf()
-    plt.close(fig)
+    plt.close('all')
     import gc
     gc.collect()
     return output_path
@@ -1218,7 +1211,8 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
     item_column_styles = []  # Sloupec "Položka" barevně laděný podle grafů
 
     for row_idx, item_name in enumerate(all_item_names):
-        row = [Paragraph((item_name[:50] + ("..." if len(item_name) > 50 else "")), body_style)]
+        # Místo paměťově náročných Paragraph objektů použijeme obyčejné stringy.
+        row = [item_name[:50] + ("..." if len(item_name) > 50 else "")]
         tint = _tint_for_label(item_name, label_color_map)
         tint_text = _text_color_for_bg(tint)
         item_column_styles.append(("BACKGROUND", (0, 1 + row_idx), (0, 1 + row_idx), HexColor(tint)))
@@ -1227,7 +1221,7 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
         for i, b in enumerate(root_budgets):
             p = price_for(b, item_name)
             prices_in_row.append((p, i))
-            row.append(Paragraph(f"{p:,.0f} Kč".replace(",", " "), body_style))
+            row.append(f"{p:,.0f} Kč".replace(",", " "))
         table_data.append(row)
         # Zvýraznění cen v řádku: minimum zeleně, maximum červeně (jen pokud existují různé ceny)
         valid_prices = [(p, i) for p, i in prices_in_row if p > 0]
@@ -1244,12 +1238,12 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
                         price_cell_styles.append(("TEXTCOLOR", (1 + col_idx, 1 + row_idx), (1 + col_idx, 1 + row_idx), HexColor("#991b1b")))
 
     # Řádek CELKEM
-    total_row = [Paragraph("<b>CELKEM</b>", body_style)]
+    total_row = ["CELKEM"]
     for t in totals:
-        total_row.append(Paragraph(f"<b>{t:,.0f} Kč</b>".replace(",", " "), body_style))
+        total_row.append(f"{t:,.0f} Kč".replace(",", " "))
     table_data.append(total_row)
 
-    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    table = LongTable(table_data, colWidths=col_widths, repeatRows=1)
     base_styles = [
         ("BACKGROUND", (0, 0), (-1, 0), HexColor("#e2e8f0")),
         ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#0f172a")),
@@ -1283,6 +1277,9 @@ def _build_round_pdf_story(round_id: UUID, db: Session, output_path: str):
     company_lines = get_company_header_lines()
     company_logo_path = get_company_logo_path()
     signature_path = get_signature_path()
+
+    for b in budgets:
+        db.expunge(b)
 
     return story, {
         "logo_path": logo_path,
@@ -1538,18 +1535,18 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
         for row in rows:
             data.append(
                 [
-                    Paragraph(html.escape(_truncate_ellipsis(row["number"], 12)), cell_style),
-                    Paragraph(html.escape(_truncate_ellipsis(row["name"], 92 if compact else 110)), cell_style),
-                    Paragraph(html.escape(_truncate_ellipsis(row["first_round"], 22)), cell_style),
-                    Paragraph(format_kc(row["first_price"]), strong_style),
-                    Paragraph(html.escape(_truncate_ellipsis(row["last_round"], 22)), cell_style),
-                    Paragraph(format_kc(row["last_price"]), strong_style),
-                    Paragraph(format_kc(row["saving"]), strong_style),
-                    Paragraph(format_percent(row["saving_pct"]), strong_style),
+                    row["number"][:12] + ("..." if len(row["number"]) > 12 else ""),
+                    row["name"][:(92 if compact else 110)] + ("..." if len(row["name"]) > (92 if compact else 110) else ""),
+                    row["first_round"][:22] + ("..." if len(row["first_round"]) > 22 else ""),
+                    format_kc(row["first_price"]),
+                    row["last_round"][:22] + ("..." if len(row["last_round"]) > 22 else ""),
+                    format_kc(row["last_price"]),
+                    format_kc(row["saving"]),
+                    format_percent(row["saving_pct"]),
                 ]
             )
 
-        table = Table(
+        table = LongTable(
             data,
             colWidths=[12 * mm, 84 * mm, 24 * mm, 24 * mm, 24 * mm, 24 * mm, 24 * mm, 18 * mm],
             repeatRows=1,
@@ -1572,6 +1569,11 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
                     ("LEFTPADDING", (0, 0), (-1, -1), 3),
                     ("RIGHTPADDING", (0, 0), (-1, -1), 3),
                     ("LINEBELOW", (0, 0), (-1, 0), 1, HexColor("#cbd5e1")),
+                    ("FONTNAME", (0, 1), (-1, -1), _CZECH_FONT),
+                    ("FONTSIZE", (0, 1), (-1, -1), 6.3),
+                    ("TEXTCOLOR", (0, 1), (-1, -1), HexColor("#334155")),
+                    ("FONTNAME", (3, 1), (3, -1), _CZECH_FONT_BOLD),
+                    ("FONTNAME", (5, 1), (-1, -1), _CZECH_FONT_BOLD),
                 ]
             )
         )
@@ -1591,13 +1593,13 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
         data: List[List[Any]] = [header]
         for row in rows:
             row_cells: List[Any] = [
-                Paragraph(html.escape(_truncate_ellipsis(row.get("object") or "", 38)), cell_style),
-                Paragraph(html.escape(_truncate_ellipsis(row["number"], 12)), cell_style),
-                Paragraph(html.escape(_truncate_ellipsis(row["name"], 78 if compact else 94)), cell_style),
-                Paragraph(format_kc(row["first_price"]), strong_style),
-                Paragraph(format_kc(row["last_price"]), strong_style),
-                Paragraph(format_kc(row["saving"]), strong_style),
-                Paragraph(format_percent(row["saving_pct"]), strong_style),
+                (row.get("object") or "")[:38] + ("..." if len(row.get("object") or "") > 38 else ""),
+                row["number"][:12] + ("..." if len(row["number"]) > 12 else ""),
+                row["name"][:(78 if compact else 94)] + ("..." if len(row["name"]) > (78 if compact else 94) else ""),
+                format_kc(row["first_price"]),
+                format_kc(row["last_price"]),
+                format_kc(row["saving"]),
+                format_percent(row["saving_pct"]),
             ]
             data.append(row_cells)
 
@@ -1611,7 +1613,7 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
             18 * mm,
         ]
 
-        table = Table(data, colWidths=col_widths, repeatRows=1)
+        table = LongTable(data, colWidths=col_widths, repeatRows=1)
         base_styles = [
             ("BACKGROUND", (0, 0), (-1, 0), HexColor("#e2e8f0")),
             ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#0f172a")),
@@ -1628,6 +1630,11 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
             ("LEFTPADDING", (0, 0), (-1, -1), 3),
             ("RIGHTPADDING", (0, 0), (-1, -1), 3),
             ("LINEBELOW", (0, 0), (-1, 0), 1, HexColor("#cbd5e1")),
+            ("FONTNAME", (0, 1), (-1, -1), _CZECH_FONT),
+            ("FONTSIZE", (0, 1), (-1, -1), 6.3),
+            ("TEXTCOLOR", (0, 1), (-1, -1), HexColor("#334155")),
+            ("FONTNAME", (3, 1), (4, -1), _CZECH_FONT_BOLD),
+            ("FONTNAME", (5, 1), (-1, -1), _CZECH_FONT_BOLD),
         ]
         table.setStyle(TableStyle(base_styles))
         return table
@@ -1849,6 +1856,12 @@ def _build_detailed_items_comparison_story(rounds: List[Any], db: Session) -> Li
 
     if len(story) > 1 and isinstance(story[-1], PageBreak):
         story.pop()
+
+    # Expunge everything stored in budgets_by_round to free memory
+    for b_list in budgets_by_round.values():
+        for b in b_list:
+            db.expunge(b)
+
     return story if len(story) > 1 else []
 
 
@@ -1887,6 +1900,10 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
             if key not in company_map:
                 company_map[key] = [None] * n_rounds
             company_map[key][round_idx] = budget_total_summary_tab(b)
+        
+        # Uvolnit paměť (SQLAlchemy drží JSON items v paměti pro celý request)
+        for b in budgets:
+            db.expunge(b)
 
     def format_kc(value: float) -> str:
         rounded = int(round(value))
@@ -2008,6 +2025,8 @@ def generate_summary_pdf_export(project_id: UUID, db: Session, output_path: str)
             continue
         story.append(PageBreak())
         story.extend(round_story)
+        import gc
+        gc.collect()
 
     detailed_items_story = _build_detailed_items_comparison_story(rounds, db)
     if detailed_items_story:
